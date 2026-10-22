@@ -1,0 +1,10 @@
+node_modules/
+dist/
+coverage/
+.env
+.env.*
+!.env.example
+.data/
+backend/uploads/avatars/
+*.log
+.DS_Store
