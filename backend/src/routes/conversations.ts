@@ -98,7 +98,7 @@ conversationsRouter.get("/", async (request, response) => {
           .filter((id) => id !== userId),
   );
   const users = await User.find({ _id: { $in: userIds } })
-    .select("displayName +avatarKey +avatarVersion")
+    .select("displayName bio +avatarKey +avatarVersion")
     .lean();
   const userById = new Map(users.map((user) => [user._id.toString(), user]));
 
@@ -116,6 +116,7 @@ conversationsRouter.get("/", async (request, response) => {
       otherUser: {
         id: other._id.toString(),
         displayName: other.displayName,
+        bio: other.bio ?? "",
         avatarUrl: avatarUrlFor(other),
       },
       latestMessage: conversation.lastMessageText
@@ -253,7 +254,7 @@ conversationsRouter.post("/", createLimiter, async (request, response) => {
   }
 
   const other = await User.findById(otherUserId)
-    .select("displayName +avatarKey +avatarVersion")
+    .select("displayName bio +avatarKey +avatarVersion")
     .exec();
   if (!other) {
     response.status(404).json({
@@ -269,6 +270,7 @@ conversationsRouter.post("/", createLimiter, async (request, response) => {
       otherUser: {
         id: other._id.toString(),
         displayName: other.displayName,
+        bio: other.bio ?? "",
         avatarUrl: avatarUrlFor(other),
       },
       latestMessage: conversation.lastMessageText

@@ -3,6 +3,25 @@
     grid-template-columns: 320px minmax(0, 1fr);
   }
 
+  .conversation-info-scrim {
+    position: absolute;
+    z-index: 4;
+    inset: 0;
+    display: block;
+    background: rgb(20 29 49 / 38%);
+  }
+
+  .conversation-info-panel {
+    position: absolute;
+    z-index: 5;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: min(88vw, 360px);
+    min-width: 0;
+    box-shadow: -18px 0 42px rgb(20 29 49 / 15%);
+  }
+
   .sidebar-header {
     padding-right: 18px;
     padding-left: 18px;
@@ -51,10 +70,6 @@
     min-height: 70px;
     gap: 9px;
     padding: 11px 14px;
-  }
-
-  .chat-header-mark {
-    display: none;
   }
 
   .message-history {

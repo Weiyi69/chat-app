@@ -10,6 +10,7 @@ export interface SearchUser {
   id: string;
   displayName: string;
   avatarUrl: string | null;
+  bio?: string;
 }
 
 export interface DirectConversation {

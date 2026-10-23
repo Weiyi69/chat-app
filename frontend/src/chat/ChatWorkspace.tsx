@@ -1,4 +1,4 @@
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient, type InfiniteData } from "@tanstack/react-query";
 import { useEffect, useMemo, useState } from "react";
 import { io, type Socket } from "socket.io-client";
 
@@ -56,6 +56,26 @@ function updateConversationPreview(current: Conversation[] | undefined, message:
     );
 }
 
+function updateSharedMedia(
+  current: InfiniteData<MessagePage, string | undefined> | undefined,
+  message: Message,
+): InfiniteData<MessagePage, string | undefined> | undefined {
+  if (!current || message.type !== "image") return current;
+  return {
+    ...current,
+    pages: current.pages.map((page, index) => {
+      const remaining = page.messages.filter((item) => item.id !== message.id);
+      if (message.deletedAt || !message.image || index !== 0) {
+        return { ...page, messages: remaining };
+      }
+      return {
+        ...page,
+        messages: mergeMessages(remaining, [message]).slice(-24),
+      };
+    }),
+  };
+}
+
 export function ChatWorkspace() {
   const { user } = useAuth();
   const queryClient = useQueryClient();
@@ -82,6 +102,7 @@ export function ChatWorkspace() {
       setSocketError("");
       void queryClient.invalidateQueries({ queryKey: ["receipts"] });
       void queryClient.invalidateQueries({ queryKey: ["messages"] });
+      void queryClient.invalidateQueries({ queryKey: ["shared-media"] });
     };
     const onDisconnect = () => setSocketConnected(false);
     const onConnectError = () => {
@@ -95,6 +116,13 @@ export function ChatWorkspace() {
       queryClient.setQueryData<Conversation[]>(["conversations"], (current) =>
         updateConversationPreview(current, message),
       );
+      if (message.type === "image") {
+        queryClient.setQueryData<InfiniteData<MessagePage, string | undefined>>(
+          ["shared-media", message.conversationId],
+          (current) => updateSharedMedia(current, message),
+        );
+        void queryClient.invalidateQueries({ queryKey: ["shared-media", message.conversationId] });
+      }
     };
     const onMessageUpdated = (message: Message) => {
       queryClient.setQueryData<MessagePage>(["messages", message.conversationId], (current) =>
@@ -103,6 +131,13 @@ export function ChatWorkspace() {
       queryClient.setQueryData<Conversation[]>(["conversations"], (current) =>
         updateConversationPreview(current, message),
       );
+      if (message.type === "image") {
+        queryClient.setQueryData<InfiniteData<MessagePage, string | undefined>>(
+          ["shared-media", message.conversationId],
+          (current) => updateSharedMedia(current, message),
+        );
+        void queryClient.invalidateQueries({ queryKey: ["shared-media", message.conversationId] });
+      }
     };
     const onGroupUpdated = ({ conversationId }: { conversationId: string }) => {
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
@@ -192,6 +227,13 @@ export function ChatWorkspace() {
     queryClient.setQueryData<Conversation[]>(["conversations"], (current) =>
       updateConversationPreview(current, message),
     );
+    if (message.type === "image") {
+      queryClient.setQueryData<InfiniteData<MessagePage, string | undefined>>(
+        ["shared-media", activeConversation.id],
+        (current) => updateSharedMedia(current, message),
+      );
+      void queryClient.invalidateQueries({ queryKey: ["shared-media", activeConversation.id] });
+    }
   }
 
   function markRead(conversationId: string, messageId: string) {
@@ -257,6 +299,13 @@ export function ChatWorkspace() {
     queryClient.setQueryData<Conversation[]>(["conversations"], (current) =>
       updateConversationPreview(current, message),
     );
+    if (message.type === "image") {
+      queryClient.setQueryData<InfiniteData<MessagePage, string | undefined>>(
+        ["shared-media", message.conversationId],
+        (current) => updateSharedMedia(current, message),
+      );
+      void queryClient.invalidateQueries({ queryKey: ["shared-media", message.conversationId] });
+    }
   }
 
   return (

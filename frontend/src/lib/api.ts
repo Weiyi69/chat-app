@@ -387,6 +387,13 @@ export const chatApi = {
       `/conversations/${encodeURIComponent(conversationId)}/messages?${query.toString()}`,
     );
   },
+  sharedMedia: (conversationId: string, before?: string) => {
+    const query = new URLSearchParams({ limit: "24" });
+    if (before) query.set("before", before);
+    return apiRequest<MessagePage>(
+      `/conversations/${encodeURIComponent(conversationId)}/media?${query.toString()}`,
+    );
+  },
   receipts: async (conversationId: string) =>
     (await apiRequest<{ positions: ReadPosition[] }>(
       `/conversations/${encodeURIComponent(conversationId)}/receipts`,

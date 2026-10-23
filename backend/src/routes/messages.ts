@@ -17,6 +17,7 @@ import {
   editOwnMessage,
   getMessageReaders,
   getMessagePage,
+  getSharedMediaPage,
   setMessagePinned,
   serializeMessageForDelivery,
 } from "../services/messages.js";
@@ -28,6 +29,7 @@ import {
   imageMessageUploadSchema,
   messagePageQuerySchema,
   pinMessageSchema,
+  sharedMediaPageQuerySchema,
   sendMessageSchema,
 } from "../validators/messages.js";
 
@@ -80,6 +82,22 @@ messagesRouter.get("/:conversationId/messages", async (request, response) => {
 
   const query = messagePageQuerySchema.parse(request.query);
   const page = await getMessagePage({
+    conversationId,
+    before: query.before,
+    limit: query.limit,
+  });
+  response.set("Cache-Control", "private, no-store").status(200).json(page);
+});
+
+messagesRouter.get("/:conversationId/media", async (request, response) => {
+  const conversationId = objectIdSchema.parse(request.params.conversationId);
+  const conversation = await findConversationForMember(conversationId, request.session.userId!);
+  if (!conversation || conversation.archivedAt) {
+    throw new ChatRequestError(404, "CONVERSATION_NOT_FOUND", "Conversation not found");
+  }
+
+  const query = sharedMediaPageQuerySchema.parse(request.query);
+  const page = await getSharedMediaPage({
     conversationId,
     before: query.before,
     limit: query.limit,

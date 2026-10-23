@@ -33,6 +33,8 @@ export const messagePageQuerySchema = z.object({
   limit: pageSizeSchema,
 });
 
+export const sharedMediaPageQuerySchema = messagePageQuerySchema;
+
 export const sendMessageSchema = z.object({
   text: z.string().trim().min(1).max(4000),
   clientId: z.uuid(),

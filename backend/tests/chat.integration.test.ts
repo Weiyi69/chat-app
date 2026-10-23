@@ -1502,6 +1502,107 @@ describe("private chat integration", () => {
     outsiderSocket.disconnect();
   });
 
+  it("paginates shared media for group members without exposing deleted or other-conversation images", async () => {
+    const alice = await createFixtureAccount("Gallery Alice", "gallery-alice@example.com");
+    const bob = await createFixtureAccount("Gallery Bob", "gallery-bob@example.com");
+    const eve = await createFixtureAccount("Gallery Eve", "gallery-eve@example.com");
+    const outsider = await createFixtureAccount("Media Outsider", "media-outsider@example.com");
+    const groupResponse = await alice.agent
+      .post("/api/v1/conversations/groups")
+      .set("x-csrf-token", alice.csrfToken)
+      .send({ name: "Shared media", memberIds: [bob.userId, eve.userId] })
+      .expect(201);
+    const groupId = groupResponse.body.conversation.id as string;
+    const otherGroupResponse = await eve.agent
+      .post("/api/v1/conversations/groups")
+      .set("x-csrf-token", eve.csrfToken)
+      .send({ name: "Other media", memberIds: [alice.userId, bob.userId] })
+      .expect(201);
+    const otherGroupId = otherGroupResponse.body.conversation.id as string;
+    await User.updateOne({ _id: eve.userId }, { $set: { bio: "A short gallery bio" } });
+    const directConversation = await alice.agent
+      .post("/api/v1/conversations")
+      .set("x-csrf-token", alice.csrfToken)
+      .send({ otherUserId: eve.userId })
+      .expect(200);
+    const conversations = await alice.agent.get("/api/v1/conversations").expect(200);
+    expect(conversations.body.conversations.find(
+      (item: { id: string }) => item.id === directConversation.body.conversation.id,
+    ).otherUser.bio).toBe("A short gallery bio");
+    const galleryMessages = Array.from({ length: 26 }, (_, index) => ({
+      conversationId: groupId,
+      senderId: index % 2 === 0 ? alice.userId : bob.userId,
+      type: "image" as const,
+      text: "",
+      image: {
+        storageKey: `converse/${groupId}/${randomUUID()}.png`,
+        contentType: "image/png" as const,
+        size: 128,
+        width: 3,
+        height: 2,
+        sha256: "a".repeat(64),
+      },
+      idempotencyKey: randomUUID(),
+      createdAt: new Date(Date.now() + index * 1000),
+      ...(index === 25 ? { deletedAt: new Date() } : {}),
+    }));
+    const [deletedImage] = await Message.insertMany(galleryMessages.filter((_, index) => index === 25));
+    if (!deletedImage) throw new Error("Expected the deleted image fixture to be inserted");
+    await Message.insertMany(galleryMessages.filter((_, index) => index !== 25));
+    const otherConversationImage = await Message.create({
+      conversationId: otherGroupId,
+      senderId: eve.userId,
+      type: "image",
+      text: "",
+      image: {
+        storageKey: `converse/${otherGroupId}/${randomUUID()}.png`,
+        contentType: "image/png",
+        size: 128,
+        width: 3,
+        height: 2,
+        sha256: "b".repeat(64),
+      },
+      idempotencyKey: randomUUID(),
+    });
+    const mediaPath = `/api/v1/conversations/${groupId}/media`;
+
+    await request(baseUrl).get(mediaPath).expect(401);
+    await outsider.agent.get(mediaPath).expect(404);
+    await bob.agent.get(`/api/v1/conversations/${groupId}/media?limit=0`).expect(400);
+    await alice.agent
+      .get(`/api/v1/conversations/${groupId}/messages/${deletedImage._id.toString()}/image`)
+      .expect(404);
+
+    const firstPage = await alice.agent.get(mediaPath).query({ limit: 10 }).expect(200);
+    expect(firstPage.body.messages).toHaveLength(10);
+    expect(firstPage.body.nextCursor).toEqual(expect.any(String));
+    expect(firstPage.body.messages.every((message: { image: { url: string } }) =>
+      message.image.url.startsWith(`/api/v1/conversations/${groupId}/messages/`),
+    )).toBe(true);
+    expect(JSON.stringify(firstPage.body)).not.toContain("storageKey");
+    expect(firstPage.body.messages.map((message: { id: string }) => message.id))
+      .not.toContain(otherConversationImage._id.toString());
+
+    const secondPage = await bob.agent
+      .get(mediaPath)
+      .query({ limit: 10, before: firstPage.body.nextCursor as string })
+      .expect(200);
+    const thirdPage = await alice.agent
+      .get(mediaPath)
+      .query({ limit: 10, before: secondPage.body.nextCursor as string })
+      .expect(200);
+    const listedIds = [
+      ...firstPage.body.messages.map((message: { id: string }) => message.id),
+      ...secondPage.body.messages.map((message: { id: string }) => message.id),
+      ...thirdPage.body.messages.map((message: { id: string }) => message.id),
+    ];
+    expect(secondPage.body.messages).toHaveLength(10);
+    expect(thirdPage.body.messages).toHaveLength(5);
+    expect(thirdPage.body.nextCursor).toBeNull();
+    expect(new Set(listedIds).size).toBe(25);
+    expect(listedIds).not.toContain(deletedImage._id.toString());
+  });
+
   it("updates only the authenticated user's display name, bio, and optional photo atomically", async () => {
     const alice = await createFixtureAccount("Profile Alice", "profile-alice@example.com");
     const bob = await createFixtureAccount("Profile Bob", "profile-bob@example.com");

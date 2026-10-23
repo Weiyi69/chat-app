@@ -276,6 +276,52 @@ export async function getMessagePage(input: {
   };
 }
 
+export async function getSharedMediaPage(input: {
+  conversationId: string;
+  before?: { createdAt: string; id: string };
+  limit: number;
+}) {
+  const conversationObjectId = new Types.ObjectId(input.conversationId);
+  const filter: Record<string, unknown> = {
+    conversationId: conversationObjectId,
+    type: "image",
+    deletedAt: { $exists: false },
+  };
+  if (input.before) {
+    const createdAt = new Date(input.before.createdAt);
+    filter.$or = [
+      { createdAt: { $lt: createdAt } },
+      { createdAt, _id: { $lt: new Types.ObjectId(input.before.id) } },
+    ];
+  }
+
+  const documents = await Message.find(filter)
+    .sort({ createdAt: -1, _id: -1 })
+    .limit(input.limit + 1)
+    .lean();
+  const hasMore = documents.length > input.limit;
+  const page = documents.slice(0, input.limit);
+  const oldest = page.at(-1);
+  const senderIds = [...new Set(page.map((message) => message.senderId.toString()))];
+  const senders = await User.find({ _id: { $in: senderIds.map((id) => new Types.ObjectId(id)) } })
+    .select("displayName +avatarKey +avatarVersion")
+    .lean();
+  const senderById = new Map(senders.map((sender) => [sender._id.toString(), sender]));
+
+  return {
+    messages: page.reverse().map((message) => {
+      const sender = senderById.get(message.senderId.toString());
+      return serializeMessage(message, sender
+        ? { displayName: sender.displayName, avatarUrl: avatarUrlFor(sender) }
+        : undefined);
+    }),
+    nextCursor:
+      hasMore && oldest
+        ? encodeMessageCursor({ createdAt: oldest.createdAt, id: oldest._id.toString() })
+        : null,
+  };
+}
+
 export const DELETED_MESSAGE_TEXT = "This message was deleted.";
 
 async function requireOwnMutableMessage(input: {

@@ -78,6 +78,7 @@ beforeEach(() => {
     maxUploadBytes: 5 * 1024 * 1024,
     contentTypes: ["image/jpeg", "image/png", "image/webp"],
   });
+  vi.spyOn(chatApi, "sharedMedia").mockResolvedValue({ messages: [], nextCursor: null });
 });
 
 function renderChat(
@@ -414,6 +415,75 @@ describe("image message composer", () => {
     expect(await screen.findByAltText("Enlarged shared image")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Close image viewer" }));
     await waitFor(() => expect(openButton).toHaveFocus());
+  });
+
+  it("opens direct conversation information, previews authorized shared media, and closes with Escape", async () => {
+    const sharedImage: Message = {
+      id: "507f1f77bcf86cd799439013",
+      conversationId: conversation.id,
+      senderId: conversation.otherUser.id,
+      type: "image",
+      text: "A shared photo",
+      createdAt: "2026-01-01T12:00:00.000Z",
+      image: {
+        contentType: "image/png",
+        size: 128,
+        width: 3,
+        height: 2,
+        url: `/api/v1/conversations/${conversation.id}/messages/507f1f77bcf86cd799439013/image`,
+      },
+    };
+    const directWithBio: Conversation = {
+      ...conversation,
+      otherUser: { ...conversation.otherUser, bio: "I enjoy quiet mornings." },
+    };
+    vi.spyOn(chatApi, "sharedMedia").mockResolvedValue({ messages: [sharedImage], nextCursor: null });
+    vi.spyOn(chatApi, "loadPrivateImage").mockResolvedValue({
+      url: "blob:shared-image",
+      revoke: vi.fn(),
+    });
+    renderChat(async () => undefined, [], directWithBio);
+
+    const infoButton = screen.getByRole("button", { name: "Conversation information" });
+    fireEvent.click(infoButton);
+
+    expect(await screen.findByRole("heading", { name: "Conversation information" })).toBeInTheDocument();
+    expect(screen.getByText("I enjoy quiet mornings.")).toBeInTheDocument();
+    const openImageButton = await screen.findByRole("button", { name: "Open image" });
+    expect(await screen.findByAltText("A shared photo")).toBeInTheDocument();
+    fireEvent.click(openImageButton);
+    expect(await screen.findByRole("dialog", { name: "Image viewer" })).toBeInTheDocument();
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Image viewer" })).not.toBeInTheDocument());
+    expect(screen.getByRole("heading", { name: "Conversation information" })).toBeInTheDocument();
+    fireEvent.keyDown(window, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("heading", { name: "Conversation information" })).not.toBeInTheDocument());
+    expect(infoButton).toHaveFocus();
+  });
+
+  it("shows group details and an empty media state in the information panel", async () => {
+    renderChat(async () => undefined, [], groupConversation);
+    fireEvent.click(screen.getByRole("button", { name: "Conversation information" }));
+
+    expect(await screen.findByRole("heading", { name: "Conversation information" })).toBeInTheDocument();
+    expect(screen.getAllByRole("heading", { name: "Weekend plans" })).toHaveLength(2);
+    expect(screen.getAllByText("2 members")).toHaveLength(2);
+    expect(await screen.findByText("No shared photos yet")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Close conversation information" }));
+    await waitFor(() => expect(screen.queryByRole("heading", { name: "Conversation information" })).not.toBeInTheDocument());
+  });
+
+  it("shows media loading failures and retries successfully", async () => {
+    vi.spyOn(chatApi, "sharedMedia")
+      .mockRejectedValueOnce(new Error("Media unavailable"))
+      .mockResolvedValue({ messages: [], nextCursor: null });
+    renderChat(async () => undefined);
+    fireEvent.click(screen.getByRole("button", { name: "Conversation information" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Shared photos could not be loaded.");
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    expect(await screen.findByText("No shared photos yet")).toBeInTheDocument();
   });
 
   it("shows the group name, sender attribution, and member details", async () => {

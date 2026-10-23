@@ -1,9 +1,12 @@
-import { useQuery, useQueryClient, type UseQueryResult } from "@tanstack/react-query";
+import { useInfiniteQuery, useQuery, useQueryClient, type UseQueryResult } from "@tanstack/react-query";
 import { useEffect, useRef, useState, type ChangeEvent, type KeyboardEvent, type RefObject } from "react";
+import { Info } from "lucide-react";
 
 import { chatApi } from "../lib/api";
 import type { Conversation, GroupConversation, Message, MessagePage, ReadPosition } from "../types";
 import { Avatar, formatDate, formatTime, mergeMessages } from "./chat-utils";
+import { ConversationInfoPanel } from "./ConversationInfoPanel";
+import { PrivateImage, PrivateImageViewer } from "./PrivateImage";
 
 export function ChatView({
   conversation,
@@ -53,6 +56,9 @@ export function ChatView({
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [viewerPath, setViewerPath] = useState<string | null>(null);
+  const [viewerMessageId, setViewerMessageId] = useState<string | null>(null);
+  const [conversationInfoOpen, setConversationInfoOpen] = useState(false);
+  const [mediaNavigationError, setMediaNavigationError] = useState("");
   const [groupDetailsOpen, setGroupDetailsOpen] = useState(false);
   const [groupNameDraft, setGroupNameDraft] = useState("");
   const [groupMemberSearch, setGroupMemberSearch] = useState("");
@@ -87,6 +93,7 @@ export function ChatView({
   const uploadController = useRef<AbortController | null>(null);
   const viewerCloseRef = useRef<HTMLButtonElement>(null);
   const viewerTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const conversationInfoTriggerRef = useRef<HTMLButtonElement>(null);
   const moreMenuRef = useRef<HTMLDivElement>(null);
   const moreTriggerRef = useRef<HTMLButtonElement | null>(null);
   const forwardDialogRef = useRef<HTMLElement>(null);
@@ -114,6 +121,15 @@ export function ChatView({
     enabled: isGroup,
     initialData: isGroup ? conversation : undefined,
   });
+  const sharedMediaQuery = useInfiniteQuery({
+    queryKey: ["shared-media", conversation.id],
+    queryFn: ({ pageParam }) => chatApi.sharedMedia(conversation.id, pageParam),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (lastPage) => lastPage.nextCursor ?? undefined,
+    enabled: conversationInfoOpen,
+    retry: false,
+  });
+  const sharedMediaMessages = sharedMediaQuery.data?.pages.flatMap((page) => page.messages) ?? [];
   const groupMemberSearchQuery = useQuery({
     queryKey: ["group-member-search", groupMemberSearch],
     queryFn: () => chatApi.searchUsers(groupMemberSearch, undefined),
@@ -189,14 +205,18 @@ export function ChatView({
   }, [forwardMessageId]);
 
   useEffect(() => {
+    const viewerIsLoaded = messages.some((message) => message.image?.url === viewerPath) ||
+      sharedMediaMessages.some((message) => message.image?.url === viewerPath);
     if (
       viewerPath &&
       !messagesQuery.isLoading &&
-      !messages.some((message) => message.image?.url === viewerPath)
+      !sharedMediaQuery.isLoading &&
+      !viewerIsLoaded
     ) {
       setViewerPath(null);
+      setViewerMessageId(null);
     }
-  }, [messages, messagesQuery.isLoading, viewerPath]);
+  }, [messages, messagesQuery.isLoading, sharedMediaMessages, sharedMediaQuery.isLoading, viewerPath]);
 
   useEffect(() => {
     const container = scrollRef.current;
@@ -218,7 +238,10 @@ export function ChatView({
     }
     viewerCloseRef.current?.focus();
     const closeOnEscape = (event: globalThis.KeyboardEvent) => {
-      if (event.key === "Escape") setViewerPath(null);
+      if (event.key === "Escape") {
+        setViewerPath(null);
+        setViewerMessageId(null);
+      }
       if (event.key === "Tab") {
         event.preventDefault();
         viewerCloseRef.current?.focus();
@@ -251,6 +274,63 @@ export function ChatView({
     setGroupPhotoSuccess("");
     setGroupPhotoProgress(0);
   }, [conversation.id]);
+
+  useEffect(() => {
+    setConversationInfoOpen(false);
+    setViewerPath(null);
+    setViewerMessageId(null);
+    setMediaNavigationError("");
+  }, [conversation.id]);
+
+  useEffect(() => {
+    if (!conversationInfoOpen) return;
+    const closeOnEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape" && !viewerPath) {
+        setConversationInfoOpen(false);
+        conversationInfoTriggerRef.current?.focus();
+      }
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [conversationInfoOpen, viewerPath]);
+
+  function closeConversationInfo() {
+    setConversationInfoOpen(false);
+    requestAnimationFrame(() => conversationInfoTriggerRef.current?.focus());
+  }
+
+  async function navigateToMessage(messageId: string) {
+    setMediaNavigationError("");
+    try {
+      let cursor = messagesQuery.data?.nextCursor ?? null;
+      let found = messages.some((message) => message.id === messageId);
+      while (cursor && !found) {
+        const older = await chatApi.messages(conversation.id, cursor);
+        queryClient.setQueryData<MessagePage>(["messages", conversation.id], (current) => ({
+          messages: mergeMessages(older.messages, current?.messages ?? []),
+          nextCursor: older.nextCursor,
+        }));
+        cursor = older.nextCursor;
+        found = older.messages.some((message) => message.id === messageId);
+      }
+      if (!found) {
+        setMediaNavigationError("The original message could not be found.");
+        return;
+      }
+      setConversationInfoOpen(false);
+      setViewerPath(null);
+      setViewerMessageId(null);
+      requestAnimationFrame(() => {
+        const target = document.getElementById(`message-${messageId}`);
+        target?.scrollIntoView({ behavior: "smooth", block: "center" });
+        setHighlightedMessageId(messageId);
+        window.setTimeout(() => setHighlightedMessageId((current) =>
+          current === messageId ? null : current), 2000);
+      });
+    } catch {
+      setMediaNavigationError("The original message could not be loaded.");
+    }
+  }
 
   function clearSelectedImage() {
     if (previewUrlRef.current) URL.revokeObjectURL(previewUrlRef.current);
@@ -710,7 +790,20 @@ export function ChatView({
             Group details
           </button>
         )}
-        <div className="chat-header-mark" aria-hidden="true">C</div>
+        <button
+          ref={conversationInfoTriggerRef}
+          type="button"
+          className="chat-header-info-button"
+          aria-label="Conversation information"
+          aria-controls="conversation-info-panel"
+          aria-expanded={conversationInfoOpen}
+          onClick={() => {
+            setMediaNavigationError("");
+            setConversationInfoOpen(true);
+          }}
+        >
+          <Info size={19} aria-hidden="true" />
+        </button>
       </header>
 
       {isGroup && groupDetailsOpen && (
@@ -922,6 +1015,8 @@ export function ChatView({
         </div>
       )}
 
+      <div className={`chat-content ${conversationInfoOpen ? "conversation-info-open" : ""}`}>
+        <div className="chat-main-column">
       {socketError && <p className="connection-banner" role="status">{socketError}</p>}
 
       <div
@@ -1088,11 +1183,12 @@ export function ChatView({
                     </div>
                   ) : message.type === "image" && image ? (
                     <div className={`message-bubble image-message-bubble ${own ? "own" : ""}`}>
-                      <MessageImage
+                      <PrivateImage
                         path={image.url}
                         alt={message.text || "Shared image"}
                         onOpen={(path, trigger) => {
                           viewerTriggerRef.current = trigger;
+                          setViewerMessageId(message.id);
                           setViewerPath(path);
                         }}
                       />
@@ -1310,6 +1406,36 @@ export function ChatView({
         </div>
         <span className="composer-hint">Enter to send · Shift + Enter for a new line</span>
       </form>
+        </div>
+        {conversationInfoOpen && (
+          <>
+            <div
+              className="conversation-info-scrim"
+              aria-hidden="true"
+              onClick={closeConversationInfo}
+            />
+            <ConversationInfoPanel
+              conversation={conversation}
+              groupDetails={groupDetails}
+              messages={sharedMediaMessages}
+              loading={sharedMediaQuery.isLoading}
+              loadingMore={sharedMediaQuery.isFetchingNextPage}
+              error={Boolean(sharedMediaQuery.error)}
+              navigationError={mediaNavigationError}
+              hasMore={Boolean(sharedMediaQuery.hasNextPage)}
+              onClose={closeConversationInfo}
+              onRetry={() => void sharedMediaQuery.refetch()}
+              onLoadMore={() => void sharedMediaQuery.fetchNextPage()}
+              onOpenImage={(path, message, trigger) => {
+                viewerTriggerRef.current = trigger;
+                setViewerMessageId(message.id);
+                setViewerPath(path);
+              }}
+              onNavigateToMessage={(messageId) => void navigateToMessage(messageId)}
+            />
+          </>
+        )}
+      </div>
       {forwardMessageId && forwardTarget && (
         <div
           className="forward-dialog-backdrop"
@@ -1377,7 +1503,10 @@ export function ChatView({
           className="image-viewer-backdrop"
           role="presentation"
           onClick={(event) => {
-            if (event.target === event.currentTarget) setViewerPath(null);
+            if (event.target === event.currentTarget) {
+              setViewerPath(null);
+              setViewerMessageId(null);
+            }
           }}
         >
           <section className="image-viewer" role="dialog" aria-modal="true" aria-label="Image viewer">
@@ -1386,11 +1515,23 @@ export function ChatView({
               type="button"
               className="image-viewer-close"
               aria-label="Close image viewer"
-              onClick={() => setViewerPath(null)}
+              onClick={() => {
+                setViewerPath(null);
+                setViewerMessageId(null);
+              }}
             >
               ×
             </button>
-            <ImageViewer path={viewerPath} />
+            <PrivateImageViewer path={viewerPath} />
+            {viewerMessageId && (
+              <button
+                type="button"
+                className="quiet-button image-viewer-message-link"
+                onClick={() => void navigateToMessage(viewerMessageId)}
+              >
+                View in conversation
+              </button>
+            )}
           </section>
         </div>
       )}
@@ -1495,113 +1636,6 @@ function MessageActionToolbar({
       )}
     </div>
   );
-}
-
-function MessageImage({
-  path,
-  alt,
-  onOpen,
-}: {
-  path: string;
-  alt: string;
-  onOpen: (path: string, trigger: HTMLButtonElement) => void;
-}) {
-  const image = usePrivateImage(path);
-  if (image.error) {
-    return (
-      <div className="image-load-error" role="status">
-        <span>Image could not be loaded.</span>
-        <button type="button" className="quiet-button" onClick={image.retry}>
-          Try again
-        </button>
-      </div>
-    );
-  }
-  if (!image.url) {
-    return <p className="image-loading" role="status">Loading image…</p>;
-  }
-  return (
-    <button
-      type="button"
-      className="message-image-button"
-      onClick={(event) => onOpen(path, event.currentTarget)}
-      aria-label="Open image"
-    >
-      <img
-        src={image.url}
-        alt={alt}
-        loading="lazy"
-        onError={image.fail}
-      />
-    </button>
-  );
-}
-
-function ImageViewer({ path }: { path: string }) {
-  const image = usePrivateImage(path);
-  if (image.error) {
-    return (
-      <div className="image-load-error" role="alert">
-        <span>Image could not be loaded.</span>
-        <button type="button" className="quiet-button" onClick={image.retry}>
-          Try again
-        </button>
-      </div>
-    );
-  }
-  if (!image.url) {
-    return <p className="image-loading" role="status">Loading image…</p>;
-  }
-  return (
-    <img
-      src={image.url}
-      alt="Enlarged shared image"
-      onError={image.fail}
-    />
-  );
-}
-
-function usePrivateImage(path: string) {
-  const [attempt, setAttempt] = useState(0);
-  const [loadState, setLoadState] = useState<{
-    path: string;
-    attempt: number;
-    url?: string;
-    error?: boolean;
-  }>({ path: "", attempt: -1 });
-
-  useEffect(() => {
-    const controller = new AbortController();
-    let active = true;
-    let release: (() => void) | undefined;
-    void chatApi.loadPrivateImage(path, controller.signal).then(
-      (image) => {
-        if (!active) {
-          image.revoke();
-          return;
-        }
-        release = image.revoke;
-        setLoadState({ path, attempt, url: image.url });
-      },
-      () => {
-        if (active) setLoadState({ path, attempt, error: true });
-      },
-    );
-    return () => {
-      active = false;
-      controller.abort();
-      release?.();
-    };
-  }, [attempt, path]);
-
-  const currentState =
-    loadState.path === path && loadState.attempt === attempt ? loadState : undefined;
-  return {
-    url: currentState?.url,
-    error: currentState?.error ?? false,
-    retry: () => setAttempt((value) => value + 1),
-    fail: () => setLoadState({ path, attempt, error: true }),
-  };
 }
 
 function formatUploadSize(bytes: number): string {
