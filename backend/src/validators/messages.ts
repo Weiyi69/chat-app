@@ -51,6 +51,11 @@ export const socketJoinSchema = z.object({
   conversationId: objectIdSchema,
 }).strict();
 
+export const socketReadSchema = z.object({
+  conversationId: objectIdSchema,
+  messageId: objectIdSchema,
+}).strict();
+
 export function encodeMessageCursor(cursor: { createdAt: Date; id: string }): string {
   return Buffer.from(
     JSON.stringify({ createdAt: cursor.createdAt.toISOString(), id: cursor.id }),

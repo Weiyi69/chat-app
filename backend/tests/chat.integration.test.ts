@@ -142,6 +142,24 @@ function joinConversation(socket: Socket, conversationId: string) {
   });
 }
 
+function updateReadPosition(
+  socket: Socket,
+  conversationId: string,
+  messageId: string,
+  extra: Record<string, unknown> = {},
+) {
+  return new Promise<{ ok: boolean; messageId?: string; error?: { code: string } }>((resolve, reject) => {
+    socket.timeout(5000).emit(
+      "conversation:read",
+      { conversationId, messageId, ...extra },
+      (error: Error | null, result: { ok: boolean; messageId?: string; error?: { code: string } }) => {
+        if (error) reject(error);
+        else resolve(result);
+      },
+    );
+  });
+}
+
 describe("private chat integration", () => {
   beforeAll(async () => {
     mongo = await MongoMemoryServer.create({
@@ -288,6 +306,60 @@ describe("private chat integration", () => {
     await expect(received).resolves.toMatchObject({
       id: sent.body.message.id,
       text: "Hello, Bob.",
+    });
+    const receiptUpdate = new Promise<{ conversationId: string; userId: string; messageId: string }>(
+      (resolve) => aliceSocket.once("receipt:updated", resolve),
+    );
+    await expect(updateReadPosition(bobSocket, conversationId, sent.body.message.id)).resolves.toMatchObject({
+      ok: true,
+      messageId: sent.body.message.id,
+    });
+    await expect(receiptUpdate).resolves.toMatchObject({
+      conversationId,
+      userId: bob.userId,
+      messageId: sent.body.message.id,
+    });
+    const directReceipts = await alice.agent.get(`/api/v1/conversations/${conversationId}/receipts`).expect(200);
+    expect(directReceipts.body.positions).toContainEqual(expect.objectContaining({
+      userId: bob.userId,
+      messageId: sent.body.message.id,
+    }));
+    const reconnectedBobSocket = await connectSocket(bob.cookie);
+    expect((await joinConversation(reconnectedBobSocket, conversationId)).ok).toBe(true);
+    const persistedAfterReconnect = await bob.agent
+      .get(`/api/v1/conversations/${conversationId}/receipts`)
+      .expect(200);
+    expect(persistedAfterReconnect.body.positions).toContainEqual(expect.objectContaining({
+      userId: bob.userId,
+      messageId: sent.body.message.id,
+    }));
+    reconnectedBobSocket.disconnect();
+    const directReaders = await alice.agent
+      .get(`/api/v1/conversations/${conversationId}/messages/${sent.body.message.id}/readers`)
+      .expect(200);
+    expect(directReaders.body.readers).toContainEqual({
+      userId: bob.userId,
+      displayName: "Bob Example",
+    });
+    await eve.agent.get(`/api/v1/conversations/${conversationId}/receipts`).expect(404);
+    await request(baseUrl).get(`/api/v1/conversations/${conversationId}/receipts`).expect(401);
+    const beforeDuplicateRead = await Conversation.findById(conversationId).select("updatedAt").lean();
+    await updateReadPosition(bobSocket, conversationId, sent.body.message.id);
+    const afterDuplicateRead = await Conversation.findById(conversationId).select("updatedAt").lean();
+    expect(afterDuplicateRead?.updatedAt).toEqual(beforeDuplicateRead?.updatedAt);
+    expect(await updateReadPosition(eveSocket, conversationId, sent.body.message.id)).toMatchObject({
+      ok: false,
+      error: { code: "CONVERSATION_NOT_OPEN" },
+    });
+    expect(await updateReadPosition(bobSocket, conversationId, sent.body.message.id, {
+      userId: alice.userId,
+    })).toMatchObject({
+      ok: false,
+      error: { code: "INVALID_PAYLOAD" },
+    });
+    expect(await updateReadPosition(bobSocket, conversationId, "507f1f77bcf86cd799439099")).toMatchObject({
+      ok: false,
+      error: { code: "MESSAGE_NOT_FOUND" },
     });
 
     const retry = await alice.agent
@@ -638,6 +710,17 @@ describe("private chat integration", () => {
       text: "Hello group",
       sender: { displayName: "Alice Example" },
     });
+    await expect(updateReadPosition(bobSocket, groupId, firstMessage.body.message.id)).resolves.toMatchObject({
+      ok: true,
+    });
+    await expect(updateReadPosition(eveSocket, groupId, firstMessage.body.message.id)).resolves.toMatchObject({
+      ok: true,
+    });
+    const firstMessageReaders = await alice.agent
+      .get(`/api/v1/conversations/${groupId}/messages/${firstMessage.body.message.id}/readers`)
+      .expect(200);
+    expect(firstMessageReaders.body.readers.map((reader: { userId: string }) => reader.userId).sort())
+      .toEqual([bob.userId, eve.userId].sort());
 
     await alice.agent
       .post(`/api/v1/conversations/groups/${groupId}/members`)
@@ -650,6 +733,11 @@ describe("private chat integration", () => {
       .send({ memberIds: [dave.userId.toUpperCase()] })
       .expect(409);
     expect((await joinConversation(daveSocket, groupId)).ok).toBe(true);
+    const readersAfterJoin = await alice.agent
+      .get(`/api/v1/conversations/${groupId}/messages/${firstMessage.body.message.id}/readers`)
+      .expect(200);
+    expect(readersAfterJoin.body.readers.map((reader: { userId: string }) => reader.userId).sort())
+      .toEqual([bob.userId, eve.userId].sort());
 
     await alice.agent
       .delete(`/api/v1/conversations/groups/${groupId}/members/${eve.userId}`)
@@ -662,6 +750,15 @@ describe("private chat integration", () => {
       .set("x-csrf-token", eve.csrfToken)
       .send({ text: "Removed member", clientId: randomUUID() })
       .expect(404);
+    await eve.agent.get(`/api/v1/conversations/${groupId}/receipts`).expect(404);
+    await eve.agent
+      .get(`/api/v1/conversations/${groupId}/messages/${firstMessage.body.message.id}/readers`)
+      .expect(404);
+    const readersAfterRemoval = await alice.agent
+      .get(`/api/v1/conversations/${groupId}/messages/${firstMessage.body.message.id}/readers`)
+      .expect(200);
+    expect(readersAfterRemoval.body.readers.map((reader: { userId: string }) => reader.userId))
+      .toEqual([bob.userId]);
     expect(await joinConversation(eveSocket, groupId)).toMatchObject({
       ok: false,
       error: { code: "CONVERSATION_NOT_FOUND" },
@@ -674,12 +771,22 @@ describe("private chat integration", () => {
     const bobReceivedAfterRemoval = new Promise<{ text: string }>((resolve) => {
       bobSocket.once("message:new", resolve);
     });
-    await alice.agent
+    const currentMembersMessage = await alice.agent
       .post(`/api/v1/conversations/${groupId}/messages`)
       .set("x-csrf-token", alice.csrfToken)
       .send({ text: "Current members only", clientId: randomUUID() })
       .expect(201);
     await expect(bobReceivedAfterRemoval).resolves.toMatchObject({ text: "Current members only" });
+    await updateReadPosition(bobSocket, groupId, currentMembersMessage.body.message.id as string);
+    await Promise.all([
+      updateReadPosition(bobSocket, groupId, firstMessage.body.message.id as string),
+      updateReadPosition(bobSocket, groupId, currentMembersMessage.body.message.id as string),
+    ]);
+    const monotonicReceipts = await bob.agent.get(`/api/v1/conversations/${groupId}/receipts`).expect(200);
+    expect(monotonicReceipts.body.positions).toContainEqual(expect.objectContaining({
+      userId: bob.userId,
+      messageId: currentMembersMessage.body.message.id,
+    }));
     const aliceReceivedSocketMessage = new Promise<{ senderId: string; text: string }>((resolve) => {
       aliceSocket.once("message:new", resolve);
     });
@@ -748,6 +855,11 @@ describe("private chat integration", () => {
       .expect(201);
     const groupImageUrl = groupImageResponse.body.message.image.url as string;
     await expect(groupImageReceived).resolves.toMatchObject({ type: "image", text: "Group image" });
+    await updateReadPosition(bobSocket, groupId, groupImageResponse.body.message.id as string);
+    const groupImageReaders = await alice.agent
+      .get(`/api/v1/conversations/${groupId}/messages/${groupImageResponse.body.message.id as string}/readers`)
+      .expect(200);
+    expect(groupImageReaders.body.readers).toContainEqual(expect.objectContaining({ userId: bob.userId }));
     await eve.agent.get(groupImageUrl).expect(404);
 
     const aliceLeave = await alice.agent

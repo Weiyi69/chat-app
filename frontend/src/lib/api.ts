@@ -1,4 +1,13 @@
-import type { Conversation, GroupConversation, Message, MessagePage, SearchUser, User } from "../types";
+import type {
+  Conversation,
+  GroupConversation,
+  Message,
+  MessagePage,
+  MessageReader,
+  ReadPosition,
+  SearchUser,
+  User,
+} from "../types";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:4000";
 
@@ -328,6 +337,14 @@ export const chatApi = {
       `/conversations/${encodeURIComponent(conversationId)}/messages?${query.toString()}`,
     );
   },
+  receipts: async (conversationId: string) =>
+    (await apiRequest<{ positions: ReadPosition[] }>(
+      `/conversations/${encodeURIComponent(conversationId)}/receipts`,
+    )).positions,
+  messageReaders: async (conversationId: string, messageId: string) =>
+    (await apiRequest<{ readers: MessageReader[] }>(
+      `/conversations/${encodeURIComponent(conversationId)}/messages/${encodeURIComponent(messageId)}/readers`,
+    )).readers,
   sendMessage: async (conversationId: string, text: string, clientId: string) =>
     (await apiRequest<{ message: Message }>(
       `/conversations/${encodeURIComponent(conversationId)}/messages`,

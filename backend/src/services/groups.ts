@@ -27,6 +27,7 @@ type GroupConversation = {
 
 type MutableGroup = GroupConversation & {
   members: GroupMember[];
+  readPositions?: { userId: Types.ObjectId; messageId: Types.ObjectId }[];
   save: () => Promise<unknown>;
 };
 
@@ -194,6 +195,9 @@ function removeMember(
   const removed = group.members.find((member) => member.userId.toString() === userId);
   if (!removed) throw new ChatRequestError(404, "GROUP_MEMBER_NOT_FOUND", "Group member not found");
   group.members = group.members.filter((member) => member.userId.toString() !== userId);
+  group.readPositions = (group.readPositions ?? []).filter(
+    (position) => position.userId.toString() !== userId,
+  );
   if (
     removed.role === "admin" &&
     !group.members.some((member) => member.role === "admin") &&

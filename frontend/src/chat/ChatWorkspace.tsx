@@ -34,6 +34,7 @@ export function ChatWorkspace() {
   const { user } = useAuth();
   const queryClient = useQueryClient();
   const [activeId, setActiveId] = useState<string | null>(null);
+  const [joinedConversationId, setJoinedConversationId] = useState<string | null>(null);
   const [socketConnected, setSocketConnected] = useState(false);
   const [socketError, setSocketError] = useState("");
   const socket = useMemo<Socket>(() => io(socketUrl, { autoConnect: false, withCredentials: true }), []);
@@ -53,6 +54,7 @@ export function ChatWorkspace() {
     const onConnect = () => {
       setSocketConnected(true);
       setSocketError("");
+      void queryClient.invalidateQueries({ queryKey: ["receipts"] });
     };
     const onDisconnect = () => setSocketConnected(false);
     const onConnectError = () => {
@@ -71,6 +73,10 @@ export function ChatWorkspace() {
     const onGroupUpdated = ({ conversationId }: { conversationId: string }) => {
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
       void queryClient.invalidateQueries({ queryKey: ["group", conversationId] });
+      void queryClient.invalidateQueries({ queryKey: ["receipts", conversationId] });
+    };
+    const onReceiptUpdated = ({ conversationId }: { conversationId: string }) => {
+      void queryClient.invalidateQueries({ queryKey: ["receipts", conversationId] });
     };
 
     socket.on("connect", onConnect);
@@ -78,6 +84,7 @@ export function ChatWorkspace() {
     socket.on("connect_error", onConnectError);
     socket.on("message:new", onMessage);
     socket.on("group:updated", onGroupUpdated);
+    socket.on("receipt:updated", onReceiptUpdated);
     socket.connect();
     return () => {
       socket.off("connect", onConnect);
@@ -85,21 +92,29 @@ export function ChatWorkspace() {
       socket.off("connect_error", onConnectError);
       socket.off("message:new", onMessage);
       socket.off("group:updated", onGroupUpdated);
+      socket.off("receipt:updated", onReceiptUpdated);
       socket.disconnect();
     };
   }, [queryClient, socket]);
 
   useEffect(() => {
+    setJoinedConversationId(null);
     if (!activeId || !socketConnected) return;
     socket.emit(
       "conversation:join",
       { conversationId: activeId },
       (result: { ok: boolean; error?: { message: string } }) => {
-        if (!result.ok) setSocketError(result.error?.message ?? "Could not open this conversation");
-        else setSocketError("");
+        if (!result.ok) {
+          setJoinedConversationId(null);
+          setSocketError(result.error?.message ?? "Could not open this conversation");
+        } else {
+          setJoinedConversationId(activeId);
+          setSocketError("");
+          void queryClient.invalidateQueries({ queryKey: ["receipts", activeId] });
+        }
       },
     );
-  }, [activeId, socket, socketConnected]);
+  }, [activeId, queryClient, socket, socketConnected]);
 
   useEffect(() => {
     if (activeId && conversationsQuery.data?.some((item) => item.id === activeId)) return;
@@ -143,6 +158,24 @@ export function ChatWorkspace() {
     );
   }
 
+  function markRead(conversationId: string, messageId: string) {
+    return new Promise<void>((resolve, reject) => {
+      socket.timeout(5000).emit(
+        "conversation:read",
+        { conversationId, messageId },
+        (error: Error | null, result: { ok: boolean; error?: { message: string } }) => {
+          if (error) {
+            reject(new Error("Read status could not be synchronized"));
+          } else if (!result.ok) {
+            reject(new Error(result.error?.message ?? "Read status could not be synchronized"));
+          } else {
+            resolve();
+          }
+        },
+      );
+    });
+  }
+
   return (
     <main className={`workspace ${activeId ? "has-active-chat" : ""}`}>
       <ConversationSidebar
@@ -157,10 +190,12 @@ export function ChatWorkspace() {
             currentUserId={user?.id ?? ""}
             messagesQuery={messagesQuery}
             socketConnected={socketConnected}
+            conversationJoined={joinedConversationId === activeId}
             socketError={socketError}
             onBack={() => setActiveId(null)}
             onSend={sendMessage}
             onSendImage={sendImage}
+            onMarkRead={(messageId) => markRead(activeConversation.id, messageId)}
           />
         ) : (
           <div className="welcome-panel">

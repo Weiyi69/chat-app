@@ -9,6 +9,14 @@ const memberSchema = new Schema(
   { _id: false },
 );
 
+const readPositionSchema = new Schema(
+  {
+    userId: { type: Schema.Types.ObjectId, ref: "User", required: true },
+    messageId: { type: Schema.Types.ObjectId, ref: "Message", required: true },
+  },
+  { _id: false },
+);
+
 const conversationSchema = new Schema(
   {
     kind: { type: String, enum: ["direct", "group"], default: "direct" },
@@ -67,6 +75,7 @@ const conversationSchema = new Schema(
       },
     },
     archivedAt: { type: Date, default: null },
+    readPositions: { type: [readPositionSchema], default: undefined },
     lastMessageId: { type: Schema.Types.ObjectId, ref: "Message", default: null },
     lastMessageText: { type: String, default: null, maxlength: 200 },
     lastMessageAt: { type: Date, default: null },

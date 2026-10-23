@@ -170,3 +170,113 @@ export async function getMessagePage(input: {
         : null,
   };
 }
+
+function isAfterOrEqual(
+  first: { createdAt: Date; _id: Types.ObjectId },
+  second: { createdAt: Date; _id: Types.ObjectId },
+) {
+  const firstTime = first.createdAt.getTime();
+  const secondTime = second.createdAt.getTime();
+  return firstTime > secondTime ||
+    (firstTime === secondTime && first._id.toString() >= second._id.toString());
+}
+
+export async function advanceReadPosition(input: {
+  conversationId: string;
+  userId: string;
+  messageId: string;
+}) {
+  const message = await Message.findOne({
+    _id: new Types.ObjectId(input.messageId),
+    conversationId: new Types.ObjectId(input.conversationId),
+  }).select("_id createdAt").lean();
+  if (!message) {
+    throw new ChatRequestError(404, "MESSAGE_NOT_FOUND", "Message not found");
+  }
+
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const conversation = await findConversationForMember(input.conversationId, input.userId);
+    if (!conversation || conversation.archivedAt) {
+      throw new ChatRequestError(404, "CONVERSATION_NOT_FOUND", "Conversation not found");
+    }
+    const current = conversation.readPositions?.find(
+      (position) => position.userId.toString() === input.userId,
+    );
+    if (current?.messageId.toString() === input.messageId) {
+      return { changed: false, messageId: input.messageId };
+    }
+
+    if (current) {
+      const currentMessage = await Message.findOne({
+        _id: current.messageId,
+        conversationId: conversation._id,
+      }).select("_id createdAt").lean();
+      if (currentMessage && !isAfterOrEqual(message, currentMessage)) {
+        return { changed: false, messageId: current.messageId.toString() };
+      }
+      current.messageId = message._id;
+    } else {
+      conversation.set("readPositions", [
+        ...(conversation.readPositions ?? []),
+        {
+          userId: new Types.ObjectId(input.userId),
+          messageId: message._id,
+        },
+      ]);
+    }
+
+    try {
+      await conversation.save();
+      return { changed: true, messageId: message._id.toString() };
+    } catch (error) {
+      if (error instanceof Error && error.name === "VersionError" && attempt < 3) continue;
+      throw error;
+    }
+  }
+  throw new ChatRequestError(409, "READ_POSITION_CONFLICT", "Read status changed. Please retry.");
+}
+
+export async function getMessageReaders(input: {
+  conversationId: string;
+  messageId: string;
+  userId: string;
+}) {
+  const conversation = await findConversationForMember(input.conversationId, input.userId);
+  if (!conversation || conversation.archivedAt) {
+    throw new ChatRequestError(404, "CONVERSATION_NOT_FOUND", "Conversation not found");
+  }
+  const message = await Message.findOne({
+    _id: new Types.ObjectId(input.messageId),
+    conversationId: conversation._id,
+  }).select("_id senderId createdAt").lean();
+  if (!message) {
+    throw new ChatRequestError(404, "MESSAGE_NOT_FOUND", "Message not found");
+  }
+
+  const positions = (conversation.readPositions ?? []).filter((position) =>
+    conversation.participants.some((participant) => participant.equals(position.userId)) &&
+    !position.userId.equals(message.senderId),
+  );
+  const readMessages = await Message.find({
+    _id: { $in: positions.map((position) => position.messageId) },
+    conversationId: conversation._id,
+  }).select("_id createdAt").lean();
+  const readMessageById = new Map(readMessages.map((readMessage) => [
+    readMessage._id.toString(),
+    readMessage,
+  ]));
+  const joinedAtByUser = new Map(
+    (conversation.members ?? []).map((member) => [member.userId.toString(), member.joinedAt]),
+  );
+  const readerIds = positions.flatMap((position) => {
+    const readMessage = readMessageById.get(position.messageId.toString());
+    if (!readMessage || !isAfterOrEqual(readMessage, message)) return [];
+    if (conversation.kind === "group") {
+      const joinedAt = joinedAtByUser.get(position.userId.toString());
+      if (!joinedAt || joinedAt.getTime() >= message.createdAt.getTime()) return [];
+    }
+    return [position.userId];
+  });
+  const users = await User.find({ _id: { $in: readerIds } }).select("displayName").lean();
+  return users.map((user) => ({ userId: user._id.toString(), displayName: user.displayName }));
+}

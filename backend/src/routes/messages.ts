@@ -6,13 +6,14 @@ import { env } from "../config/env.js";
 import { requireAuthentication } from "../middleware/authenticate.js";
 import { Message } from "../models/message.js";
 import { publishMessage } from "../sockets/realtime.js";
-import { findConversationForMember } from "../services/conversations.js";
+import { findConversationForMember, listReadPositions } from "../services/conversations.js";
 import { createPersistedImageMessage } from "../services/image-messages.js";
 import { processUploadedImage } from "../services/image-processing.js";
 import { imageStorage } from "../services/image-storage.js";
 import {
   ChatRequestError,
   createPersistedMessage,
+  getMessageReaders,
   getMessagePage,
   serializeMessageForDelivery,
 } from "../services/messages.js";
@@ -67,6 +68,29 @@ messagesRouter.get("/:conversationId/messages", async (request, response) => {
   });
   response.status(200).json(page);
 });
+
+messagesRouter.get("/:conversationId/receipts", async (request, response) => {
+  const conversationId = objectIdSchema.parse(request.params.conversationId);
+  const positions = await listReadPositions(conversationId, request.session.userId!);
+  if (!positions) {
+    throw new ChatRequestError(404, "CONVERSATION_NOT_FOUND", "Conversation not found");
+  }
+  response.status(200).json({ positions });
+});
+
+messagesRouter.get(
+  "/:conversationId/messages/:messageId/readers",
+  async (request, response) => {
+    const conversationId = objectIdSchema.parse(request.params.conversationId);
+    const messageId = objectIdSchema.parse(request.params.messageId);
+    const readers = await getMessageReaders({
+      conversationId,
+      messageId,
+      userId: request.session.userId!,
+    });
+    response.status(200).json({ readers });
+  },
+);
 
 messagesRouter.post("/:conversationId/messages", sendLimiter, async (request, response) => {
   const conversationId = objectIdSchema.parse(request.params.conversationId);

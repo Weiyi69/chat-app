@@ -61,6 +61,8 @@ beforeAll(() => {
 });
 
 beforeEach(() => {
+  vi.spyOn(chatApi, "receipts").mockResolvedValue([]);
+  vi.spyOn(chatApi, "messageReaders").mockResolvedValue([]);
   vi.spyOn(chatApi, "imageLimits").mockResolvedValue({
     maxUploadBytes: 5 * 1024 * 1024,
     contentTypes: ["image/jpeg", "image/png", "image/webp"],
@@ -90,10 +92,12 @@ function renderChat(
         currentUserId="507f191e810c19729de860ea"
         messagesQuery={messagesQuery}
         socketConnected
+        conversationJoined
         socketError=""
         onBack={() => undefined}
         onSend={async () => undefined}
         onSendImage={onSendImage}
+        onMarkRead={async () => undefined}
       />
     );
   }
@@ -219,6 +223,48 @@ describe("image message composer", () => {
     expect(screen.getByText("Members (2)")).toBeInTheDocument();
     expect(screen.getByText("Current User (you)")).toBeInTheDocument();
     expect(screen.getByText("Group Partner", { selector: ".group-member-name" })).toBeInTheDocument();
+  });
+
+  it("shows an accessible direct read label only when the recipient position covers the message", async () => {
+    const message: Message = {
+      id: "507f1f77bcf86cd799439022",
+      conversationId: conversation.id,
+      senderId: "507f191e810c19729de860ea",
+      type: "text",
+      text: "Read this",
+      createdAt: "2026-01-01T12:00:00.000Z",
+    };
+    vi.mocked(chatApi.receipts).mockResolvedValue([{
+      userId: "507f191e810c19729de860eb",
+      messageId: message.id,
+      createdAt: message.createdAt,
+      joinedAt: "1970-01-01T00:00:00.000Z",
+    }]);
+    renderChat(async () => undefined, [message]);
+
+    expect(await screen.findByLabelText("Read by recipient")).toHaveTextContent("Seen");
+  });
+
+  it("loads group readers only after the Seen by control is opened", async () => {
+    const message: Message = {
+      id: "507f1f77bcf86cd799439023",
+      conversationId: groupConversation.id,
+      senderId: groupConversation.members[0].userId,
+      type: "text",
+      text: "Plan confirmed",
+      createdAt: "2026-01-01T12:00:00.000Z",
+    };
+    vi.mocked(chatApi.messageReaders).mockResolvedValue([{
+      userId: groupConversation.members[1].userId,
+      displayName: "Group Partner",
+    }]);
+    renderChat(async () => undefined, [message], groupConversation);
+
+    expect(screen.queryByText("Seen by Group Partner")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Seen by" }));
+
+    expect(await screen.findByText("Seen by Group Partner")).toBeInTheDocument();
+    expect(chatApi.messageReaders).toHaveBeenCalledWith(groupConversation.id, message.id);
   });
 
   it("previews, cancels, saves, and removes an administrator's group photo", async () => {

@@ -4,13 +4,20 @@ import type { Server as HttpServer } from "node:http";
 import { env } from "../config/env.js";
 import { sessionMiddleware, sessionStore } from "../config/session.js";
 import { Conversation } from "../models/conversation.js";
+import { ChatRequestError } from "../services/chat-errors.js";
 import { findConversationForMember } from "../services/conversations.js";
-import { createPersistedMessage, serializeMessage, serializeMessageForDelivery } from "../services/messages.js";
-import { socketJoinSchema, socketMessageSchema } from "../validators/messages.js";
+import {
+  advanceReadPosition,
+  createPersistedMessage,
+  serializeMessage,
+  serializeMessageForDelivery,
+} from "../services/messages.js";
+import { socketJoinSchema, socketMessageSchema, socketReadSchema } from "../validators/messages.js";
 
 type Ack = (
   result:
     | { ok: true; message?: ReturnType<typeof serializeMessage> }
+    | { ok: true; messageId?: string }
     | { ok: false; error: { code: string; message: string } },
 ) => void;
 
@@ -133,10 +140,79 @@ export function attachSocketServer(server: HttpServer): Server {
         acknowledge?.({ ok: false, error: { code: "MESSAGE_FAILED", message: "Message could not be sent" } });
       });
     });
+
+    socket.on("conversation:read", (payload: unknown, acknowledge?: Ack) => {
+      void (async () => {
+        if (!(await isSessionActive(socket.data.sessionId, socket.data.userId))) {
+          acknowledge?.({
+            ok: false,
+            error: { code: "UNAUTHENTICATED", message: "Authentication required" },
+          });
+          socket.disconnect(true);
+          return;
+        }
+        const parsed = socketReadSchema.safeParse(payload);
+        if (!parsed.success) {
+          acknowledge?.({ ok: false, error: { code: "INVALID_PAYLOAD", message: "Invalid request" } });
+          return;
+        }
+        if (!socket.rooms.has(`conversation:${parsed.data.conversationId}`)) {
+          acknowledge?.({
+            ok: false,
+            error: { code: "CONVERSATION_NOT_OPEN", message: "Open the conversation before updating read status" },
+          });
+          return;
+        }
+
+        const result = await advanceReadPosition({
+          ...parsed.data,
+          userId: socket.data.userId,
+        });
+        if (result.changed) {
+          await publishReceiptUpdate(
+            parsed.data.conversationId,
+            socket.data.userId,
+            result.messageId,
+          );
+        }
+        acknowledge?.({ ok: true, messageId: result.messageId });
+      })().catch((error: unknown) => {
+        if (error instanceof ChatRequestError) {
+          acknowledge?.({
+            ok: false,
+            error: { code: error.code, message: error.message },
+          });
+          return;
+        }
+        console.error(
+          "Socket receipt update failed",
+          error instanceof Error ? error.name : "UnknownError",
+        );
+        acknowledge?.({ ok: false, error: { code: "RECEIPT_FAILED", message: "Read status could not be updated" } });
+      });
+    });
   });
 
   socketServer = io;
   return io;
+}
+
+async function publishReceiptUpdate(
+  conversationId: string,
+  userId: string,
+  messageId: string,
+): Promise<void> {
+  if (!socketServer) throw new Error("Socket server has not been initialized");
+  const conversation = await Conversation.findOne({
+    _id: conversationId,
+    participants: userId,
+    archivedAt: null,
+  }).select("participants").lean();
+  if (!conversation) return;
+  const update = { conversationId, userId, messageId };
+  for (const participantId of conversation.participants) {
+    socketServer.to(`user:${participantId.toString()}`).emit("receipt:updated", update);
+  }
 }
 
 export async function publishMessage(message: ReturnType<typeof serializeMessage>): Promise<void> {

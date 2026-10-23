@@ -2,7 +2,7 @@ import { useQuery, useQueryClient, type UseQueryResult } from "@tanstack/react-q
 import { useEffect, useRef, useState, type ChangeEvent, type KeyboardEvent } from "react";
 
 import { chatApi } from "../lib/api";
-import type { Conversation, GroupConversation, MessagePage } from "../types";
+import type { Conversation, GroupConversation, MessagePage, ReadPosition } from "../types";
 import { Avatar, formatDate, formatTime, mergeMessages } from "./chat-utils";
 
 export function ChatView({
@@ -10,15 +10,18 @@ export function ChatView({
   currentUserId,
   messagesQuery,
   socketConnected,
+  conversationJoined,
   socketError,
   onBack,
   onSend,
   onSendImage,
+  onMarkRead,
 }: {
   conversation: Conversation;
   currentUserId: string;
   messagesQuery: UseQueryResult<MessagePage, Error>;
   socketConnected: boolean;
+  conversationJoined: boolean;
   socketError: string;
   onBack: () => void;
   onSend: (text: string, clientId: string) => Promise<void>;
@@ -29,6 +32,7 @@ export function ChatView({
     onProgress: (progress: number) => void,
     signal: AbortSignal,
   ) => Promise<void>;
+  onMarkRead: (messageId: string) => Promise<void>;
 }) {
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
@@ -49,6 +53,8 @@ export function ChatView({
   const [groupPhotoOperation, setGroupPhotoOperation] = useState<"upload" | "remove" | null>(null);
   const [groupPhotoError, setGroupPhotoError] = useState("");
   const [groupPhotoSuccess, setGroupPhotoSuccess] = useState("");
+  const [selectedReceiptMessageId, setSelectedReceiptMessageId] = useState<string | null>(null);
+  const [receiptError, setReceiptError] = useState("");
   const idempotencyKey = useRef<string | null>(null);
   const imageIdempotencyKey = useRef<string | null>(null);
   const previewUrlRef = useRef<string | null>(null);
@@ -56,6 +62,8 @@ export function ChatView({
   const viewerCloseRef = useRef<HTMLButtonElement>(null);
   const viewerTriggerRef = useRef<HTMLButtonElement | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const lastReadAttemptRef = useRef<string | null>(null);
+  const pendingReadRef = useRef<string | null>(null);
   const pinnedToBottom = useRef(true);
   const queryClient = useQueryClient();
   const imageLimitsQuery = useQuery({
@@ -85,11 +93,35 @@ export function ChatView({
   const groupPhotoUrl = groupDetails ? groupDetails.photoUrl : isGroup ? conversation.photoUrl : null;
   const page = messagesQuery.data;
   const messages = page?.messages ?? [];
+  const receiptsQuery = useQuery({
+    queryKey: ["receipts", conversation.id],
+    queryFn: () => chatApi.receipts(conversation.id),
+  });
+  const readersQuery = useQuery({
+    queryKey: ["message-readers", conversation.id, selectedReceiptMessageId],
+    queryFn: () => chatApi.messageReaders(conversation.id, selectedReceiptMessageId!),
+    enabled: isGroup && Boolean(selectedReceiptMessageId),
+  });
+
+  useEffect(() => {
+    pinnedToBottom.current = true;
+    lastReadAttemptRef.current = null;
+    pendingReadRef.current = null;
+    setSelectedReceiptMessageId(null);
+    setReceiptError("");
+  }, [conversation.id]);
 
   useEffect(() => {
     const container = scrollRef.current;
     if (container && pinnedToBottom.current) container.scrollTop = container.scrollHeight;
-  }, [messages]);
+    markLatestVisibleMessageRead();
+  }, [messages, socketConnected, conversationJoined]);
+
+  useEffect(() => {
+    const onVisibilityChange = () => markLatestVisibleMessageRead();
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => document.removeEventListener("visibilitychange", onVisibilityChange);
+  }, [conversation.id, messages, socketConnected, conversationJoined]);
 
   useEffect(() => {
     if (!viewerPath) {
@@ -333,6 +365,46 @@ export function ChatView({
 
   const title = isGroup ? conversation.name : conversation.otherUser.displayName;
   const maxGroupPhotoBytes = groupPhotoLimitsQuery.data?.maxUploadBytes ?? 5 * 1024 * 1024;
+  const lastMessage = messages.at(-1);
+
+  function markLatestVisibleMessageRead() {
+    if (
+      !socketConnected ||
+      !conversationJoined ||
+      document.visibilityState !== "visible" ||
+      !lastMessage ||
+      lastReadAttemptRef.current === lastMessage.id ||
+      pendingReadRef.current === lastMessage.id
+    ) return;
+    const container = scrollRef.current;
+    if (!container || container.scrollHeight - container.scrollTop - container.clientHeight >= 80) return;
+    pendingReadRef.current = lastMessage.id;
+    void onMarkRead(lastMessage.id).then(() => {
+      lastReadAttemptRef.current = lastMessage.id;
+      pendingReadRef.current = null;
+      setReceiptError("");
+      void queryClient.invalidateQueries({ queryKey: ["receipts", conversation.id] });
+    }).catch(() => {
+      pendingReadRef.current = null;
+      setReceiptError("Read status could not be synchronized. It will retry when the chat is viewed again.");
+    });
+  }
+
+  const recipientPosition = receiptsQuery.data?.find((position) => position.userId !== currentUserId);
+  const isAtOrBeforePosition = (message: { id: string; createdAt: string }, position: ReadPosition) => {
+    const messageTime = new Date(message.createdAt).getTime();
+    const positionTime = new Date(position.createdAt).getTime();
+    return messageTime < positionTime ||
+      (messageTime === positionTime && message.id <= position.messageId);
+  };
+  const latestReadOwnMessage = !isGroup && recipientPosition
+    ? [...messages].reverse().find((message) =>
+        message.senderId === currentUserId && isAtOrBeforePosition(message, recipientPosition),
+      )
+    : undefined;
+  const latestSentOwnMessage = [...messages].reverse().find(
+    (message) => message.senderId === currentUserId,
+  );
 
   return (
     <div className="chat-view">
@@ -588,6 +660,7 @@ export function ChatView({
         onScroll={(event) => {
           const target = event.currentTarget;
           pinnedToBottom.current = target.scrollHeight - target.scrollTop - target.clientHeight < 80;
+          markLatestVisibleMessageRead();
         }}
         aria-live="polite"
         aria-label={isGroup ? `Messages in ${conversation.name}` : `Messages with ${conversation.otherUser.displayName}`}
@@ -660,6 +733,41 @@ export function ChatView({
                     <div className={`message-bubble ${own ? "own" : ""}`}>{message.text}</div>
                   )}
                   <time>{formatTime(message.createdAt)}</time>
+                  {own && !isGroup && latestReadOwnMessage?.id === message.id && (
+                    <span className="message-receipt" aria-label="Read by recipient">Seen</span>
+                  )}
+                  {own && latestSentOwnMessage?.id === message.id &&
+                    (isGroup || latestReadOwnMessage?.id !== message.id) && (
+                    <span className="message-receipt" aria-label="Message saved">Sent</span>
+                  )}
+                  {own && isGroup && (
+                    <div className="message-reader-details">
+                      <button
+                        type="button"
+                        className="message-readers-toggle"
+                        aria-expanded={selectedReceiptMessageId === message.id}
+                        aria-controls={`message-readers-${message.id}`}
+                        onClick={() => setSelectedReceiptMessageId(
+                          selectedReceiptMessageId === message.id ? null : message.id,
+                        )}
+                      >
+                        Seen by
+                      </button>
+                      {selectedReceiptMessageId === message.id && (
+                        <div className="message-readers" id={`message-readers-${message.id}`}>
+                          {readersQuery.isLoading && <span>Loading readers...</span>}
+                          {readersQuery.error && (
+                            <span role="status">Reader list unavailable.</span>
+                          )}
+                          {readersQuery.data && (
+                            readersQuery.data.length
+                              ? <span>Seen by {readersQuery.data.map((reader) => reader.displayName).join(", ")}</span>
+                              : <span>No one has read this message yet.</span>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
                 {isGroup && own && <Avatar name={senderName} avatarUrl={senderAvatar} />}
               </div>
@@ -667,6 +775,12 @@ export function ChatView({
           );
         })}
       </div>
+
+      {(receiptError || receiptsQuery.error) && (
+        <p className="receipt-error" role="status">
+          {receiptError || "Read status could not be loaded."}
+        </p>
+      )}
 
       <form
         className="composer"

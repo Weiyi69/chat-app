@@ -60,3 +60,15 @@ export interface MessagePage {
   messages: Message[];
   nextCursor: string | null;
 }
+
+export interface ReadPosition {
+  userId: string;
+  messageId: string;
+  createdAt: string;
+  joinedAt: string;
+}
+
+export interface MessageReader {
+  userId: string;
+  displayName: string;
+}
