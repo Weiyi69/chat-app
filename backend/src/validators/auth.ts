@@ -10,3 +10,9 @@ export const loginSchema = z.object({
   email: z.email().trim().toLowerCase(),
   password: z.string().min(1).max(128),
 }).strict();
+
+export const profileUpdateSchema = z.object({
+  displayName: z.string().trim().min(1).max(64),
+  bio: z.string().max(160),
+  removeAvatar: z.enum(["true", "false"]).optional(),
+}).strict();

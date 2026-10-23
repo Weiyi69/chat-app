@@ -1,6 +1,6 @@
 # Converse
 
-Converse is a private messaging app built with React, TypeScript, Vite, Tailwind CSS, Express, Socket.IO, and MongoDB/Mongoose. It supports account registration and login, local profile and group photos, user discovery, direct and group conversations, bounded message history, and persisted real-time text and image messaging.
+Converse is a private messaging app built with React, TypeScript, Vite, Tailwind CSS, Express, Socket.IO, and MongoDB/Mongoose. It supports account registration and login, editable display names and bios, local profile and group photos, user discovery, direct and group conversations, bounded message history, and persisted real-time text and image messaging.
 
 This project is not end-to-end encrypted. Do not use it to send information that requires end-to-end confidentiality.
 

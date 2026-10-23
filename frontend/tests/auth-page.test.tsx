@@ -63,6 +63,7 @@ describe("registration form", () => {
     vi.mocked(authApi.register).mockResolvedValue({
       id: "abc123",
       displayName: "Ada Lovelace",
+      bio: "",
       email: "ada@example.com",
       avatarUrl: null,
     });
@@ -89,6 +90,7 @@ describe("login form", () => {
     vi.mocked(authApi.login).mockResolvedValue({
       id: "abc123",
       displayName: "Ada Lovelace",
+      bio: "",
       email: "ada@example.com",
       avatarUrl: null,
     });

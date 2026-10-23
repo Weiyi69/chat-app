@@ -24,8 +24,8 @@ export function ConversationSidebar({
   const [groupName, setGroupName] = useState("");
   const [selectedMemberIds, setSelectedMemberIds] = useState<string[]>([]);
   const [logoutError, setLogoutError] = useState("");
-  const [profilePhotoOpen, setProfilePhotoOpen] = useState(false);
-  const profilePhotoButton = useRef<HTMLButtonElement>(null);
+  const [profileEditorOpen, setProfileEditorOpen] = useState(false);
+  const profileEditorButton = useRef<HTMLButtonElement>(null);
   const conversationsQuery = useQuery({
     queryKey: ["conversations"],
     queryFn: chatApi.conversations,
@@ -78,9 +78,9 @@ export function ConversationSidebar({
   const queryError =
     conversationsQuery.error instanceof Error ? conversationsQuery.error.message : "";
 
-  function closeProfilePhoto() {
-    setProfilePhotoOpen(false);
-    requestAnimationFrame(() => profilePhotoButton.current?.focus());
+  function closeProfileEditor() {
+    setProfileEditorOpen(false);
+    requestAnimationFrame(() => profileEditorButton.current?.focus());
   }
 
   return (
@@ -102,12 +102,12 @@ export function ConversationSidebar({
             <span>{user?.email}</span>
             {logoutError && <span className="inline-error" role="alert">{logoutError}</span>}
             <button
-              ref={profilePhotoButton}
+              ref={profileEditorButton}
               type="button"
               className="quiet-button"
-              onClick={() => setProfilePhotoOpen(true)}
+              onClick={() => setProfileEditorOpen(true)}
             >
-              Edit profile photo
+              Edit profile
             </button>
             <button
               type="button"
@@ -289,7 +289,7 @@ export function ConversationSidebar({
         <span className={`status-dot ${socketConnected ? "online" : ""}`} />
         {socketConnected ? "Live connection" : "Connecting..."}
       </footer>
-      {profilePhotoOpen && <ProfilePhotoDialog onClose={closeProfilePhoto} />}
+      {profileEditorOpen && <ProfilePhotoDialog onClose={closeProfileEditor} />}
     </aside>
   );
 }

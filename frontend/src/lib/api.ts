@@ -210,6 +210,54 @@ export const authApi = {
   me: async () => (await apiRequest<{ user: User }>("/auth/me")).user,
   avatarLimits: async () =>
     (await apiRequest<{ avatar: { maxUploadBytes: number; contentTypes: string[] } }>("/limits")).avatar,
+  updateProfile: async (
+    profile: { displayName: string; bio: string; avatar?: File | null; removeAvatar?: boolean },
+    onProgress: (progress: number) => void,
+  ): Promise<User> => {
+    const token = await ensureCsrfToken();
+    return new Promise<User>((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      const form = new FormData();
+      form.append("displayName", profile.displayName);
+      form.append("bio", profile.bio);
+      if (profile.avatar) form.append("avatar", profile.avatar);
+      if (profile.removeAvatar) form.append("removeAvatar", "true");
+      xhr.open("PUT", `${API_BASE}/api/v1/auth/me/profile`);
+      xhr.withCredentials = true;
+      xhr.setRequestHeader("x-csrf-token", token);
+      xhr.upload.addEventListener("progress", (event) => {
+        if (event.lengthComputable) onProgress(Math.round((event.loaded / event.total) * 100));
+      });
+      xhr.addEventListener("load", () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          try {
+            resolve((JSON.parse(xhr.responseText) as { user: User }).user);
+          } catch {
+            reject(new ApiError("The server returned an invalid response", xhr.status, "INVALID_RESPONSE"));
+          }
+          return;
+        }
+        let payload: { error?: { code?: string; message?: string } } = {};
+        try {
+          payload = JSON.parse(xhr.responseText) as typeof payload;
+        } catch {
+          // Use the generic request error below when the server did not return JSON.
+        }
+        if (xhr.status === 403 && payload.error?.code === "CSRF_INVALID") csrfToken = undefined;
+        reject(
+          new ApiError(
+            payload.error?.message ?? "Profile could not be saved",
+            xhr.status,
+            payload.error?.code ?? "REQUEST_FAILED",
+          ),
+        );
+      });
+      xhr.addEventListener("error", () => {
+        reject(new ApiError("Network error while saving profile", 0, "NETWORK_ERROR"));
+      });
+      xhr.send(form);
+    });
+  },
   uploadAvatar: async (file: File, onProgress: (progress: number) => void): Promise<User> => {
     const token = await ensureCsrfToken();
     return new Promise<User>((resolve, reject) => {

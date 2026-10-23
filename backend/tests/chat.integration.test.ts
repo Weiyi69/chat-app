@@ -1502,6 +1502,135 @@ describe("private chat integration", () => {
     outsiderSocket.disconnect();
   });
 
+  it("updates only the authenticated user's display name, bio, and optional photo atomically", async () => {
+    const alice = await createFixtureAccount("Profile Alice", "profile-alice@example.com");
+    const bob = await createFixtureAccount("Profile Bob", "profile-bob@example.com");
+    const profilePath = "/api/v1/auth/me/profile";
+    const unauthorizedAgent = request.agent(baseUrl);
+    const unauthorizedCsrf = await unauthorizedAgent.get("/api/v1/auth/csrf").expect(200);
+
+    await unauthorizedAgent
+      .put(profilePath)
+      .set("x-csrf-token", unauthorizedCsrf.body.token as string)
+      .field("displayName", "Intruder")
+      .field("bio", "Not authorized")
+      .expect(401);
+    await alice.agent
+      .put(profilePath)
+      .field("displayName", "Missing CSRF")
+      .field("bio", "")
+      .expect(403);
+
+    const updated = await alice.agent
+      .put(profilePath)
+      .set("x-csrf-token", alice.csrfToken)
+      .field("displayName", "  Alice Updated  ")
+      .field("bio", "A short profile")
+      .expect(200);
+    expect(updated.body.user).toMatchObject({
+      id: alice.userId,
+      displayName: "Alice Updated",
+      bio: "A short profile",
+      email: "profile-alice@example.com",
+    });
+    expect(updated.body.user).not.toHaveProperty("passwordHash");
+    expect((await User.findById(alice.userId).select("+displayNameSearch").lean())?.displayNameSearch)
+      .toBe("alice updated");
+
+    await alice.agent
+      .put(profilePath)
+      .set("x-csrf-token", alice.csrfToken)
+      .field("displayName", "   ")
+      .field("bio", "")
+      .expect(400);
+    await alice.agent
+      .put(profilePath)
+      .set("x-csrf-token", alice.csrfToken)
+      .field("displayName", "x".repeat(65))
+      .field("bio", "")
+      .expect(400);
+    await alice.agent
+      .put(profilePath)
+      .set("x-csrf-token", alice.csrfToken)
+      .field("displayName", "Alice Updated")
+      .field("bio", "x".repeat(161))
+      .expect(400);
+
+    await alice.agent
+      .put(profilePath)
+      .set("x-csrf-token", alice.csrfToken)
+      .field("displayName", "Attempted account switch")
+      .field("bio", "")
+      .field("userId", bob.userId)
+      .expect(400);
+    expect((await User.findById(bob.userId).lean())?.displayName).toBe("Profile Bob");
+    expect((await alice.agent.get("/api/v1/auth/me").expect(200)).body.user.displayName)
+      .toBe("Alice Updated");
+
+    const maximumBio = "b".repeat(160);
+    const bioAtLimit = await alice.agent
+      .put(profilePath)
+      .set("x-csrf-token", alice.csrfToken)
+      .field("displayName", "Alice Updated")
+      .field("bio", maximumBio)
+      .expect(200);
+    expect(bioAtLimit.body.user.bio).toBe(maximumBio);
+    const clearedBio = await alice.agent
+      .put(profilePath)
+      .set("x-csrf-token", alice.csrfToken)
+      .field("displayName", "Alice Updated")
+      .field("bio", "")
+      .expect(200);
+    expect(clearedBio.body.user.bio).toBe("");
+
+    const jpeg = await sharp({ create: { width: 64, height: 96, channels: 3, background: "#2288cc" } })
+      .jpeg()
+      .toBuffer();
+    const combinedUpdate = await alice.agent
+      .put(profilePath)
+      .set("x-csrf-token", alice.csrfToken)
+      .field("displayName", "Photo and text")
+      .field("bio", "Saved together")
+      .attach("avatar", jpeg, { filename: "profile.jpg", contentType: "image/jpeg" })
+      .expect(200);
+    const photoUser = await User.findById(alice.userId).select("+avatarKey").exec();
+    expect(combinedUpdate.body.user).toMatchObject({
+      displayName: "Photo and text",
+      bio: "Saved together",
+    });
+    expect(combinedUpdate.body.user.avatarUrl).toBeTruthy();
+    expect(photoUser?.avatarKey).toBeTruthy();
+
+    const failedCombinedUpdate = await alice.agent
+      .put(profilePath)
+      .set("x-csrf-token", alice.csrfToken)
+      .field("displayName", "Must not partially save")
+      .field("bio", "Must not partially save")
+      .attach("avatar", Buffer.from("not an image"), { filename: "invalid.png", contentType: "image/png" })
+      .expect(415);
+    expect(failedCombinedUpdate.body.error.code).toBe("AVATAR_UNSUPPORTED");
+    const unchangedProfile = await alice.agent.get("/api/v1/auth/me").expect(200);
+    expect(unchangedProfile.body.user).toMatchObject({
+      displayName: "Photo and text",
+      bio: "Saved together",
+      avatarUrl: combinedUpdate.body.user.avatarUrl,
+    });
+
+    const removed = await alice.agent
+      .put(profilePath)
+      .set("x-csrf-token", alice.csrfToken)
+      .field("displayName", "Photo removed")
+      .field("bio", "")
+      .field("removeAvatar", "true")
+      .expect(200);
+    expect(removed.body.user).toMatchObject({
+      displayName: "Photo removed",
+      bio: "",
+      avatarUrl: null,
+    });
+    expect(existsSync(join(avatarStorageRoot, photoUser!.avatarKey!))).toBe(false);
+  });
+
   it("validates, persists, serves, replaces, and removes private profile photos", async () => {
     const alice = await registerAccount("Avatar Alice", "avatar-alice@example.com");
     const bob = await registerAccount("Avatar Bob", "avatar-bob@example.com");

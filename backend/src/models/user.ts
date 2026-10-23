@@ -4,6 +4,7 @@ const userSchema = new Schema(
   {
     displayName: { type: String, required: true, trim: true, maxlength: 64 },
     displayNameSearch: { type: String, required: true, select: false },
+    bio: { type: String, default: "", maxlength: 160 },
     email: { type: String, required: true, unique: true, lowercase: true, trim: true },
     passwordHash: { type: String, required: true, select: false },
     avatarUrl: { type: String, default: null },

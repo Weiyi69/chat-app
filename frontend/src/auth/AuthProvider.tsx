@@ -12,6 +12,10 @@ interface AuthContextValue {
   login: (data: { email: string; password: string }) => Promise<void>;
   register: (data: { displayName: string; email: string; password: string }) => Promise<void>;
   logout: () => Promise<void>;
+  updateProfile: (
+    profile: { displayName: string; bio: string; avatar?: File | null; removeAvatar?: boolean },
+    onProgress: (progress: number) => void,
+  ) => Promise<void>;
   updateAvatar: (file: File, onProgress: (progress: number) => void) => Promise<void>;
   removeAvatar: () => Promise<void>;
 }
@@ -52,6 +56,16 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         queryClient.setQueryData(["auth", "me"], null);
         queryClient.removeQueries({ queryKey: ["conversations"] });
         queryClient.removeQueries({ queryKey: ["messages"] });
+      },
+      updateProfile: async (profile, onProgress) => {
+        const updatedUser = await authApi.updateProfile(profile, onProgress);
+        queryClient.setQueryData(["auth", "me"], updatedUser);
+        await Promise.all([
+          queryClient.invalidateQueries({ queryKey: ["conversations"] }),
+          queryClient.invalidateQueries({ queryKey: ["messages"] }),
+          queryClient.invalidateQueries({ queryKey: ["group"] }),
+          queryClient.invalidateQueries({ queryKey: ["message-readers"] }),
+        ]);
       },
       updateAvatar: async (file, onProgress) => {
         const updatedUser = await authApi.uploadAvatar(file, onProgress);

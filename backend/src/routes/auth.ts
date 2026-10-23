@@ -15,7 +15,7 @@ import {
   writeAvatar,
 } from "../services/avatars.js";
 import { revokeSessionConnections } from "../sockets/realtime.js";
-import { loginSchema, registerSchema } from "../validators/auth.js";
+import { loginSchema, profileUpdateSchema, registerSchema } from "../validators/auth.js";
 
 export const authRouter = Router();
 
@@ -34,9 +34,19 @@ const avatarLimiter = rateLimit({
   legacyHeaders: false,
   message: { error: { code: "RATE_LIMITED", message: "Too many photo updates. Please try again later." } },
 });
+const profileLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 30,
+  standardHeaders: "draft-8",
+  legacyHeaders: false,
+});
 const avatarUpload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: env.AVATAR_MAX_UPLOAD_BYTES, files: 1, fields: 0, parts: 1 },
+});
+const profileUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: env.AVATAR_MAX_UPLOAD_BYTES, files: 1, fields: 3, parts: 4 },
 });
 
 async function discardUnreferencedAvatar(key: string, context: string): Promise<void> {
@@ -48,6 +58,7 @@ async function discardUnreferencedAvatar(key: string, context: string): Promise<
 function serializeUser(user: {
   _id: { toString(): string };
   displayName: string;
+  bio?: string;
   email: string;
   avatarUrl?: string | null;
   avatarKey?: string | null;
@@ -56,6 +67,7 @@ function serializeUser(user: {
   return {
     id: user._id.toString(),
     displayName: user.displayName,
+    bio: user.bio ?? "",
     email: user.email,
     avatarUrl: avatarUrlFor(user),
   };
@@ -126,6 +138,85 @@ authRouter.post("/login", authenticationLimiter, async (request, response) => {
 
   response.status(200).json({ user: serializeUser(user) });
 });
+
+authRouter.put(
+  "/me/profile",
+  requireAuthentication,
+  profileLimiter,
+  profileUpload.single("avatar"),
+  (request, response, next) => {
+    if (request.file || request.body?.removeAvatar === "true") {
+      avatarLimiter(request, response, next);
+      return;
+    }
+    next();
+  },
+  async (request, response) => {
+    const input = profileUpdateSchema.parse(request.body);
+    const removeAvatar = input.removeAvatar === "true";
+    if (request.file && removeAvatar) {
+      throw new AvatarRequestError(400, "VALIDATION_ERROR", "Choose a photo or remove the current photo, not both.");
+    }
+
+    let newKey: string | null = null;
+    if (request.file) {
+      newKey = await writeAvatar(await processAvatar(request.file.buffer));
+    }
+
+    let current;
+    try {
+      current = await User.findById(request.session.userId)
+        .select("+avatarKey +avatarVersion")
+        .exec();
+    } catch (error) {
+      await discardUnreferencedAvatar(newKey ?? "", "Failed profile update cleanup failed");
+      throw error;
+    }
+    if (!current) {
+      await discardUnreferencedAvatar(newKey ?? "", "Failed profile update cleanup failed");
+      throw new AvatarRequestError(404, "USER_NOT_FOUND", "Account not found.");
+    }
+
+    const previousKey = current.avatarKey ?? null;
+    const updateAvatar = Boolean(newKey) || (removeAvatar && Boolean(previousKey));
+    const set: Record<string, unknown> = {
+      displayName: input.displayName,
+      displayNameSearch: input.displayName.toLowerCase(),
+      bio: input.bio,
+    };
+    if (updateAvatar) set.avatarKey = newKey;
+    const update = {
+      $set: set,
+      ...(updateAvatar ? { $inc: { avatarVersion: 1 } } : {}),
+    };
+    const avatarReference = previousKey
+      ? { avatarKey: previousKey }
+      : { $or: [{ avatarKey: null }, { avatarKey: { $exists: false } }] };
+
+    let updated;
+    try {
+      updated = await User.findOneAndUpdate(
+        { _id: current._id, ...(updateAvatar ? avatarReference : {}) },
+        update,
+        { new: true, runValidators: true },
+      )
+        .select("+avatarKey +avatarVersion")
+        .exec();
+    } catch (error) {
+      await discardUnreferencedAvatar(newKey ?? "", "Failed profile update cleanup failed");
+      throw error;
+    }
+    if (!updated) {
+      await discardUnreferencedAvatar(newKey ?? "", "Failed profile update cleanup failed");
+      throw new AvatarRequestError(409, "PROFILE_CHANGED", "Your profile photo changed in another request. Please retry.");
+    }
+
+    if (updateAvatar && previousKey) {
+      await discardUnreferencedAvatar(previousKey, "Replaced avatar cleanup failed");
+    }
+    response.status(200).json({ user: serializeUser(updated) });
+  },
+);
 
 authRouter.put(
   "/me/avatar",
@@ -238,7 +329,7 @@ authRouter.get("/me", async (request, response) => {
   }
 
   const user = await User.findById(userId)
-    .select("displayName email +avatarKey +avatarVersion")
+    .select("displayName bio email +avatarKey +avatarVersion")
     .exec();
   if (!user) {
     const previousSessionId = request.sessionID;
