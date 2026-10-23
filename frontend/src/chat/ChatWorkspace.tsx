@@ -16,10 +16,10 @@ function updateConversationPreview(current: Conversation[] | undefined, message:
       conversation.id === message.conversationId
         ? {
             ...conversation,
-                latestMessage: {
-                  text: (message.text || "[Image]").slice(0, 200),
-                  createdAt: message.createdAt,
-                },
+            latestMessage: {
+              text: (message.text || "[Image]").slice(0, 200),
+              createdAt: message.createdAt,
+            },
           }
         : conversation,
     )
@@ -68,17 +68,23 @@ export function ChatWorkspace() {
         updateConversationPreview(current, message),
       );
     };
+    const onGroupUpdated = ({ conversationId }: { conversationId: string }) => {
+      void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+      void queryClient.invalidateQueries({ queryKey: ["group", conversationId] });
+    };
 
     socket.on("connect", onConnect);
     socket.on("disconnect", onDisconnect);
     socket.on("connect_error", onConnectError);
     socket.on("message:new", onMessage);
+    socket.on("group:updated", onGroupUpdated);
     socket.connect();
     return () => {
       socket.off("connect", onConnect);
       socket.off("disconnect", onDisconnect);
       socket.off("connect_error", onConnectError);
       socket.off("message:new", onMessage);
+      socket.off("group:updated", onGroupUpdated);
       socket.disconnect();
     };
   }, [queryClient, socket]);

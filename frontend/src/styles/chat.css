@@ -51,6 +51,251 @@
   font-weight: 750;
 }
 
+.group-details-button {
+  flex: 0 0 auto;
+  min-height: 34px;
+  padding: 0 11px;
+  font-size: 10px;
+}
+
+.group-details-backdrop {
+  position: fixed;
+  z-index: 20;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: rgb(20 29 49 / 42%);
+}
+
+.group-details-dialog {
+  width: min(100%, 470px);
+  max-height: min(88dvh, 700px);
+  overflow-y: auto;
+  padding: 24px;
+  border: 1px solid #e9edf4;
+  border-radius: 18px;
+  background: #fff;
+  box-shadow: 0 24px 80px rgb(20 29 49 / 22%);
+}
+
+.group-details-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 20px;
+}
+
+.group-details-heading h2 {
+  margin: 2px 0 0;
+  color: #202a3d;
+  font-size: 20px;
+  letter-spacing: -0.04em;
+}
+
+.group-photo-editor {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin: 0 0 16px;
+  padding: 14px;
+  border: 1px solid #edf0f5;
+  border-radius: 14px;
+  background: #fbfcfe;
+}
+
+.group-photo-preview img {
+  width: 100%;
+  height: 100%;
+  border-radius: inherit;
+  object-fit: cover;
+}
+
+.group-photo-controls {
+  display: grid;
+  min-width: 0;
+  justify-items: start;
+  gap: 6px;
+}
+
+.group-photo-controls strong {
+  color: #354155;
+  font-size: 12px;
+}
+
+.group-photo-controls .muted-note {
+  font-size: 10px;
+}
+
+.group-photo-picker {
+  position: relative;
+  display: inline-flex;
+  min-height: 30px;
+  align-items: center;
+  overflow: hidden;
+  padding: 0 10px;
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.group-photo-picker input {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  cursor: pointer;
+  opacity: 0;
+}
+
+.group-photo-picker:focus-within {
+  outline: 2px solid #7787ed;
+  outline-offset: 2px;
+}
+
+.group-photo-progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 8px;
+  color: #647087;
+  font-size: 10px;
+}
+
+.group-photo-progress progress {
+  width: min(100%, 220px);
+  accent-color: #6576dc;
+}
+
+.group-photo-success {
+  margin: 8px 0 0;
+  color: #23704b;
+  font-size: 11px;
+}
+
+.group-photo-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  margin: 9px 0 12px;
+}
+
+.group-photo-actions .group-photo-save {
+  width: auto;
+  min-width: 96px;
+  min-height: 36px;
+  flex: 0 0 auto;
+  padding: 0 13px;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.group-details-dialog h3 {
+  margin: 22px 0 10px;
+  color: #354155;
+  font-size: 12px;
+}
+
+.group-details-name {
+  margin: 0;
+  color: #354155;
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.group-rename-form,
+.group-add-members {
+  display: grid;
+  gap: 8px;
+}
+
+.group-rename-form label,
+.group-add-members label {
+  color: #354155;
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.group-inline-action {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.group-inline-action input {
+  min-width: 0;
+  min-height: 38px;
+  flex: 1;
+  padding: 0 11px;
+  border: 1px solid #dce2eb;
+  border-radius: 10px;
+  color: #1f293c;
+  font-size: 12px;
+}
+
+.group-member-list {
+  display: grid;
+  gap: 8px;
+  max-height: 250px;
+  overflow-y: auto;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.group-member-list li {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 9px;
+}
+
+.group-member-name {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  color: #354155;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.group-member-role {
+  color: #8992a3;
+  font-size: 10px;
+  text-transform: capitalize;
+}
+
+.group-member-list .quiet-button,
+.group-inline-action .quiet-button {
+  min-height: 32px;
+  padding: 0 9px;
+  font-size: 10px;
+}
+
+.group-member-search-results {
+  max-height: 180px;
+  overflow-y: auto;
+  padding: 4px;
+  border: 1px solid #edf0f5;
+  border-radius: 12px;
+}
+
+.group-member-search-results .person-result {
+  padding: 6px;
+}
+
+.group-member-search-results .person-result:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.group-leave-button {
+  margin-top: 20px;
+  color: #a4414d;
+}
+
 .back-button {
   display: none;
   width: 36px;
@@ -121,6 +366,13 @@
   flex-direction: column;
   align-items: flex-start;
   gap: 5px;
+}
+
+.group-message-sender {
+  padding: 0 3px;
+  color: #707b8e;
+  font-size: 10px;
+  font-weight: 650;
 }
 
 .message-content.own {

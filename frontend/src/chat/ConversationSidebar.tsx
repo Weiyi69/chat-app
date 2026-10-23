@@ -20,6 +20,9 @@ export function ConversationSidebar({
   const queryClient = useQueryClient();
   const [search, setSearch] = useState("");
   const [conversationFilter, setConversationFilter] = useState("");
+  const [groupMode, setGroupMode] = useState(false);
+  const [groupName, setGroupName] = useState("");
+  const [selectedMemberIds, setSelectedMemberIds] = useState<string[]>([]);
   const [logoutError, setLogoutError] = useState("");
   const [profilePhotoOpen, setProfilePhotoOpen] = useState(false);
   const profilePhotoButton = useRef<HTMLButtonElement>(null);
@@ -39,7 +42,7 @@ export function ConversationSidebar({
   const visibleConversations = (conversationsQuery.data ?? []).filter((item) => {
     const needle = conversationFilter.trim().toLowerCase();
     return !needle ||
-      item.otherUser.displayName.toLowerCase().includes(needle) ||
+      (item.kind === "group" ? item.name : item.otherUser.displayName).toLowerCase().includes(needle) ||
       item.latestMessage?.text.toLowerCase().includes(needle);
   });
 
@@ -51,6 +54,22 @@ export function ConversationSidebar({
         ...current.filter((item) => item.id !== conversation.id),
       ]);
       onSelect(conversation.id);
+      setSearch("");
+      queryClient.invalidateQueries({ queryKey: ["conversations"] });
+    },
+  });
+
+  const createGroup = useMutation({
+    mutationFn: () => chatApi.createGroup(groupName.trim(), selectedMemberIds),
+    onSuccess: (conversation) => {
+      queryClient.setQueryData<Conversation[]>(["conversations"], (current = []) => [
+        conversation,
+        ...current.filter((item) => item.id !== conversation.id),
+      ]);
+      onSelect(conversation.id);
+      setGroupMode(false);
+      setGroupName("");
+      setSelectedMemberIds([]);
       setSearch("");
       queryClient.invalidateQueries({ queryKey: ["conversations"] });
     },
@@ -118,7 +137,32 @@ export function ConversationSidebar({
       </label>
 
       <section className="people-search" aria-labelledby="new-chat-heading">
-        <h2 id="new-chat-heading">Start a conversation</h2>
+        <div className="people-search-heading">
+          <h2 id="new-chat-heading">{groupMode ? "Create a group" : "Start a conversation"}</h2>
+          <button
+            type="button"
+            className="quiet-button group-mode-button"
+            aria-pressed={groupMode}
+            onClick={() => {
+              setGroupMode((current) => !current);
+              setSelectedMemberIds([]);
+              createGroup.reset();
+            }}
+          >
+            {groupMode ? "Cancel" : "New group"}
+          </button>
+        </div>
+        {groupMode && (
+          <label className="group-name-field">
+            <span className="sr-only">Group name</span>
+            <input
+              value={groupName}
+              onChange={(event) => setGroupName(event.target.value)}
+              placeholder="Group name"
+              maxLength={80}
+            />
+          </label>
+        )}
         <label className="search-box compact">
           <span className="sr-only">Find people by name or email</span>
           <input
@@ -135,14 +179,27 @@ export function ConversationSidebar({
             {people.map((person) => (
               <button
                 type="button"
-                className="person-result"
+                className={`person-result ${selectedMemberIds.includes(person.id) ? "selected" : ""}`}
                 key={person.id}
-                disabled={createConversation.isPending}
-                onClick={() => createConversation.mutate(person.id)}
+                disabled={groupMode ? createGroup.isPending : createConversation.isPending}
+                aria-pressed={groupMode ? selectedMemberIds.includes(person.id) : undefined}
+                onClick={() => {
+                  if (!groupMode) {
+                    createConversation.mutate(person.id);
+                    return;
+                  }
+                  setSelectedMemberIds((current) =>
+                    current.includes(person.id)
+                      ? current.filter((id) => id !== person.id)
+                      : [...current, person.id],
+                  );
+                }}
               >
                 <Avatar name={person.displayName} avatarUrl={person.avatarUrl} />
                 <span>{person.displayName}</span>
-                <span className="result-action" aria-hidden="true">+</span>
+                <span className="result-action" aria-hidden="true">
+                  {groupMode && selectedMemberIds.includes(person.id) ? "✓" : "+"}
+                </span>
               </button>
             ))}
             {createConversation.error && (
@@ -158,6 +215,20 @@ export function ConversationSidebar({
                 {searchQuery.isFetchingNextPage ? "Loading..." : "Show more people"}
               </button>
             )}
+          </div>
+        )}
+        {groupMode && (
+          <div className="group-create-actions">
+            <p className="muted-note">Select at least two people. You’ll be the group admin.</p>
+            <button
+              type="button"
+              className="primary-button"
+              disabled={groupName.trim().length === 0 || selectedMemberIds.length < 2 || createGroup.isPending}
+              onClick={() => createGroup.mutate()}
+            >
+              {createGroup.isPending ? "Creating..." : `Create group${selectedMemberIds.length ? ` (${selectedMemberIds.length})` : ""}`}
+            </button>
+            {createGroup.error && <p className="inline-error" role="alert">{createGroup.error.message}</p>}
           </div>
         )}
       </section>
@@ -192,12 +263,15 @@ export function ConversationSidebar({
               onClick={() => onSelect(conversation.id)}
             >
               <Avatar
-                name={conversation.otherUser.displayName}
-                avatarUrl={conversation.otherUser.avatarUrl}
+                name={conversation.kind === "group" ? conversation.name : conversation.otherUser.displayName}
+                avatarUrl={conversation.kind === "group" ? conversation.photoUrl : conversation.otherUser.avatarUrl}
                 className="large"
+                fallback={conversation.kind === "group" ? "group" : "initial"}
               />
               <span className="conversation-copy">
-                <span className="conversation-name">{conversation.otherUser.displayName}</span>
+                <span className="conversation-name">
+                  {conversation.kind === "group" ? conversation.name : conversation.otherUser.displayName}
+                </span>
                 <span className="conversation-preview">
                   {conversation.latestMessage?.text ?? "Say hello"}
                 </span>

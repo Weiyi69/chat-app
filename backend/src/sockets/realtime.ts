@@ -3,8 +3,9 @@ import type { Server as HttpServer } from "node:http";
 
 import { env } from "../config/env.js";
 import { sessionMiddleware, sessionStore } from "../config/session.js";
+import { Conversation } from "../models/conversation.js";
 import { findConversationForMember } from "../services/conversations.js";
-import { createPersistedMessage, serializeMessage } from "../services/messages.js";
+import { createPersistedMessage, serializeMessage, serializeMessageForDelivery } from "../services/messages.js";
 import { socketJoinSchema, socketMessageSchema } from "../validators/messages.js";
 
 type Ack = (
@@ -45,6 +46,7 @@ export function attachSocketServer(server: HttpServer): Server {
 
   io.on("connection", (socket) => {
     socket.join(`session:${socket.data.sessionId}`);
+    socket.join(`user:${socket.data.userId}`);
     const expirationTimer = socket.data.sessionExpiresAt
       ? setTimeout(
           () => socket.disconnect(true),
@@ -120,8 +122,8 @@ export function attachSocketServer(server: HttpServer): Server {
           text: parsed.data.text,
           idempotencyKey: parsed.data.clientId,
         });
-        const serialized = serializeMessage(message);
-        io.to(`conversation:${parsed.data.conversationId}`).emit("message:new", serialized);
+        const serialized = await serializeMessageForDelivery(message);
+        await publishMessage(serialized);
         acknowledge?.({ ok: true, message: serialized });
       })().catch((error: unknown) => {
         console.error(
@@ -137,9 +139,30 @@ export function attachSocketServer(server: HttpServer): Server {
   return io;
 }
 
-export function publishMessage(message: ReturnType<typeof serializeMessage>): void {
+export async function publishMessage(message: ReturnType<typeof serializeMessage>): Promise<void> {
   if (!socketServer) throw new Error("Socket server has not been initialized");
+  const conversation = await Conversation.findById(message.conversationId)
+    .select("kind participants")
+    .lean();
+  if (!conversation) return;
+  if (conversation.kind === "group") {
+    for (const userId of conversation.participants) {
+      socketServer.to(`user:${userId.toString()}`).emit("message:new", message);
+    }
+    return;
+  }
   socketServer.to(`conversation:${message.conversationId}`).emit("message:new", message);
+}
+
+export async function publishGroupUpdate(groupId: string): Promise<void> {
+  if (!socketServer) return;
+  const group = await Conversation.findOne({ _id: groupId, kind: "group", archivedAt: null })
+    .select("participants")
+    .lean();
+  if (!group) return;
+  for (const userId of group.participants) {
+    socketServer.to(`user:${userId.toString()}`).emit("group:updated", { conversationId: groupId });
+  }
 }
 
 export function revokeSessionConnections(sessionId: string): void {

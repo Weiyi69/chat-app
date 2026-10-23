@@ -12,10 +12,12 @@ import type { Server as SocketServer } from "socket.io";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
 import { app } from "../src/app.js";
-import { avatarStorageRoot, imageStorageRoot } from "../src/config/env.js";
+import { avatarStorageRoot, env, imageStorageRoot } from "../src/config/env.js";
+import { sessionStore } from "../src/config/session.js";
 import { Conversation } from "../src/models/conversation.js";
 import { Message } from "../src/models/message.js";
 import { User } from "../src/models/user.js";
+import * as avatarService from "../src/services/avatars.js";
 import { cleanupOrphanedImages } from "../src/services/image-messages.js";
 import { imageStorage } from "../src/services/image-storage.js";
 import { attachSocketServer } from "../src/sockets/realtime.js";
@@ -33,6 +35,7 @@ let mongo: MongoMemoryServer | undefined;
 let server: HttpServer | undefined;
 let socketServer: SocketServer | undefined;
 let baseUrl: string;
+let sharedAccounts: { alice: RegisteredAccount; bob: RegisteredAccount; eve: RegisteredAccount } | undefined;
 
 function cookieHeader(response: { headers: Record<string, string | string[] | undefined> }): string {
   const cookies = response.headers["set-cookie"];
@@ -52,6 +55,58 @@ async function registerAccount(displayName: string, email: string): Promise<Regi
     .expect(201);
   const currentCsrf = await agent.get("/api/v1/auth/csrf").expect(200);
 
+  return {
+    agent,
+    userId: response.body.user.id as string,
+    cookie: cookieHeader(response),
+    csrfToken: currentCsrf.body.token as string,
+  };
+}
+
+async function createFixtureAccount(displayName: string, email: string): Promise<RegisteredAccount> {
+  const user = await User.create({
+    displayName,
+    displayNameSearch: displayName.toLowerCase(),
+    email,
+    passwordHash: "fixture-account-password-hash",
+  });
+  const agent = request.agent(baseUrl);
+  const csrfResponse = await agent.get("/api/v1/auth/csrf").expect(200);
+  const cookie = cookieHeader(csrfResponse);
+  const encodedSession = decodeURIComponent(cookie.slice(cookie.indexOf("=") + 1));
+  const sessionId = encodedSession.slice(2, encodedSession.lastIndexOf("."));
+  await new Promise<void>((resolve, reject) => {
+    sessionStore.get(sessionId, (error, session) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      if (!session) {
+        reject(new Error("Expected the test session to be stored"));
+        return;
+      }
+      session.userId = user._id.toString();
+      sessionStore.set(sessionId, session, (saveError) => saveError ? reject(saveError) : resolve());
+    });
+  });
+  const csrf = await agent.get("/api/v1/auth/csrf").expect(200);
+  return {
+    agent,
+    userId: user._id.toString(),
+    cookie,
+    csrfToken: csrf.body.token as string,
+  };
+}
+
+async function loginAccount(email: string): Promise<RegisteredAccount> {
+  const agent = request.agent(baseUrl);
+  const csrf = await agent.get("/api/v1/auth/csrf").expect(200);
+  const response = await agent
+    .post("/api/v1/auth/login")
+    .set("x-csrf-token", csrf.body.token as string)
+    .send({ email, password: "a-secure-test-password" })
+    .expect(200);
+  const currentCsrf = await agent.get("/api/v1/auth/csrf").expect(200);
   return {
     agent,
     userId: response.body.user.id as string,
@@ -138,6 +193,7 @@ describe("private chat integration", () => {
     const alice = await registerAccount("Alice Example", "alice@example.com");
     const bob = await registerAccount("Bob Example", "bob@example.com");
     const eve = await registerAccount("Eve Example", "eve@example.com");
+    sharedAccounts = { alice, bob, eve };
 
     const ownProfile = await alice.agent.get("/api/v1/auth/me").expect(200);
     expect(ownProfile.body.user).toMatchObject({
@@ -203,6 +259,9 @@ describe("private chat integration", () => {
     const conversationId = create.body.conversation.id as string;
     expect(duplicate.body.conversation.id).toBe(conversationId);
     expect(await Conversation.countDocuments()).toBe(1);
+    await Conversation.collection.updateOne({ _id: new mongoose.Types.ObjectId(conversationId) }, { $unset: { kind: "" } });
+    expect((await Conversation.collection.findOne({ _id: new mongoose.Types.ObjectId(conversationId) }))?.kind)
+      .toBeUndefined();
 
     const aliceSocket = await connectSocket(alice.cookie);
     const bobSocket = await connectSocket(bob.cookie);
@@ -478,6 +537,421 @@ describe("private chat integration", () => {
     await bob.agent.get("/api/v1/auth/me").expect(401);
     aliceSocket.disconnect();
     eveSocket.disconnect();
+  });
+
+  it("creates secure groups, persists group messages, enforces roles, and archives empty groups", async () => {
+    if (!sharedAccounts) throw new Error("Expected private chat test accounts");
+    const alice = sharedAccounts.alice;
+    const bob = await loginAccount("bob@example.com");
+    const eve = sharedAccounts.eve;
+    const dave = await createFixtureAccount("Group Dave", "group-dave@example.com");
+
+    await alice.agent
+      .post("/api/v1/conversations/groups")
+      .set("x-csrf-token", alice.csrfToken)
+      .send({ name: "Too small", memberIds: [bob.userId] })
+      .expect(400);
+    await alice.agent
+      .post("/api/v1/conversations/groups")
+      .set("x-csrf-token", alice.csrfToken)
+      .send({ name: "Self invite", memberIds: [bob.userId, alice.userId] })
+      .expect(400);
+    await alice.agent
+      .post("/api/v1/conversations/groups")
+      .send({ name: "Missing CSRF", memberIds: [bob.userId, eve.userId] })
+      .expect(403);
+
+    const created = await alice.agent
+      .post("/api/v1/conversations/groups")
+      .set("x-csrf-token", alice.csrfToken)
+      .send({ name: "Weekend plans", memberIds: [bob.userId, eve.userId] })
+      .expect(201);
+    const groupId = created.body.conversation.id as string;
+    expect(created.body.conversation).toMatchObject({
+      kind: "group",
+      name: "Weekend plans",
+      currentRole: "admin",
+      members: [
+        { userId: alice.userId, displayName: "Alice Example", role: "admin" },
+        { userId: bob.userId, displayName: "Bob Example", role: "member" },
+        { userId: eve.userId, displayName: "Eve Example", role: "member" },
+      ],
+    });
+    const groupRecord = await Conversation.findById(groupId).lean();
+    expect(groupRecord?.pairKey).toBe(`group:${groupId}`);
+    expect(groupRecord?.photoReference).toBeNull();
+    expect(groupRecord?.creatorId?.toString()).toBe(alice.userId);
+    expect(groupRecord?.createdAt).toBeInstanceOf(Date);
+    expect(groupRecord?.updatedAt).toBeInstanceOf(Date);
+
+    await bob.agent.get(`/api/v1/conversations/groups/${groupId}`).expect(200);
+    await dave.agent.get(`/api/v1/conversations/groups/${groupId}`).expect(404);
+    const outsiderConversations = await dave.agent.get("/api/v1/conversations").expect(200);
+    expect(outsiderConversations.body.conversations).toHaveLength(0);
+    const bobRename = await bob.agent
+      .patch(`/api/v1/conversations/groups/${groupId}`)
+      .set("x-csrf-token", bob.csrfToken)
+      .send({ name: "Unauthorized rename" })
+      .expect(403);
+    expect(bobRename.body.error.code).toBe("GROUP_ADMIN_REQUIRED");
+    await bob.agent
+      .post(`/api/v1/conversations/groups/${groupId}/members`)
+      .set("x-csrf-token", bob.csrfToken)
+      .send({ memberIds: [dave.userId] })
+      .expect(403);
+
+    const renamed = await alice.agent
+      .patch(`/api/v1/conversations/groups/${groupId}`)
+      .set("x-csrf-token", alice.csrfToken)
+      .send({ name: "Updated plans" })
+      .expect(200);
+    expect(renamed.body.conversation.name).toBe("Updated plans");
+    const aliceSocket = await connectSocket(alice.cookie);
+    const bobSocket = await connectSocket(bob.cookie);
+    const eveSocket = await connectSocket(eve.cookie);
+    const daveSocket = await connectSocket(dave.cookie);
+    expect((await joinConversation(aliceSocket, groupId)).ok).toBe(true);
+    expect((await joinConversation(bobSocket, groupId)).ok).toBe(true);
+    expect((await joinConversation(eveSocket, groupId)).ok).toBe(true);
+    expect(await joinConversation(daveSocket, groupId)).toMatchObject({
+      ok: false,
+      error: { code: "CONVERSATION_NOT_FOUND" },
+    });
+
+    const bobReceived = new Promise<{ id: string; text: string; sender?: { displayName: string } }>(
+      (resolve) => bobSocket.once("message:new", resolve),
+    );
+    const eveReceived = new Promise<{ id: string }>((resolve) => eveSocket.once("message:new", resolve));
+    const firstMessage = await alice.agent
+      .post(`/api/v1/conversations/${groupId}/messages`)
+      .set("x-csrf-token", alice.csrfToken)
+      .send({ text: "Hello group", clientId: randomUUID() })
+      .expect(201);
+    await expect(bobReceived).resolves.toMatchObject({
+      id: firstMessage.body.message.id,
+      text: "Hello group",
+      sender: { displayName: "Alice Example" },
+    });
+    await expect(eveReceived).resolves.toMatchObject({ id: firstMessage.body.message.id });
+    const groupHistory = await bob.agent.get(`/api/v1/conversations/${groupId}/messages`).expect(200);
+    expect(groupHistory.body.messages[0]).toMatchObject({
+      text: "Hello group",
+      sender: { displayName: "Alice Example" },
+    });
+
+    await alice.agent
+      .post(`/api/v1/conversations/groups/${groupId}/members`)
+      .set("x-csrf-token", alice.csrfToken)
+      .send({ memberIds: [dave.userId] })
+      .expect(200);
+    await alice.agent
+      .post(`/api/v1/conversations/groups/${groupId}/members`)
+      .set("x-csrf-token", alice.csrfToken)
+      .send({ memberIds: [dave.userId.toUpperCase()] })
+      .expect(409);
+    expect((await joinConversation(daveSocket, groupId)).ok).toBe(true);
+
+    await alice.agent
+      .delete(`/api/v1/conversations/groups/${groupId}/members/${eve.userId}`)
+      .set("x-csrf-token", alice.csrfToken)
+      .expect(200);
+    await eve.agent.get(`/api/v1/conversations/groups/${groupId}`).expect(404);
+    await eve.agent.get(`/api/v1/conversations/${groupId}/messages`).expect(404);
+    await eve.agent
+      .post(`/api/v1/conversations/${groupId}/messages`)
+      .set("x-csrf-token", eve.csrfToken)
+      .send({ text: "Removed member", clientId: randomUUID() })
+      .expect(404);
+    expect(await joinConversation(eveSocket, groupId)).toMatchObject({
+      ok: false,
+      error: { code: "CONVERSATION_NOT_FOUND" },
+    });
+
+    let removedMemberReceived = false;
+    eveSocket.on("message:new", (message: { conversationId: string }) => {
+      if (message.conversationId === groupId) removedMemberReceived = true;
+    });
+    const bobReceivedAfterRemoval = new Promise<{ text: string }>((resolve) => {
+      bobSocket.once("message:new", resolve);
+    });
+    await alice.agent
+      .post(`/api/v1/conversations/${groupId}/messages`)
+      .set("x-csrf-token", alice.csrfToken)
+      .send({ text: "Current members only", clientId: randomUUID() })
+      .expect(201);
+    await expect(bobReceivedAfterRemoval).resolves.toMatchObject({ text: "Current members only" });
+    const aliceReceivedSocketMessage = new Promise<{ senderId: string; text: string }>((resolve) => {
+      aliceSocket.once("message:new", resolve);
+    });
+    const socketAck = new Promise<{
+      ok: boolean;
+      message?: { senderId: string; text: string };
+      error?: { code: string };
+    }>((resolve, reject) => {
+      bobSocket.timeout(5000).emit(
+        "message:send",
+        {
+          conversationId: groupId,
+          text: "Group socket message",
+          clientId: randomUUID(),
+          senderId: alice.userId,
+        },
+        (error: Error | null, result: {
+          ok: boolean;
+          message?: { senderId: string; text: string };
+          error?: { code: string };
+        }) => error ? reject(error) : resolve(result),
+      );
+    });
+    await expect(socketAck).resolves.toMatchObject({
+      ok: false,
+      error: { code: "INVALID_PAYLOAD" },
+    });
+    const socketDelivery = new Promise<{ senderId: string; text: string }>((resolve, reject) => {
+      bobSocket.timeout(5000).emit(
+        "message:send",
+        { conversationId: groupId, text: "Group socket message", clientId: randomUUID() },
+        (error: Error | null, result: { ok: boolean; message?: { senderId: string; text: string } }) => {
+          if (error) {
+            reject(error);
+            return;
+          }
+          if (!result.ok || !result.message) {
+            reject(new Error("Group socket message was rejected"));
+            return;
+          }
+          resolve(result.message);
+        },
+      );
+    });
+    const [deliveredToAlice, sentFromSocket] = await Promise.all([
+      aliceReceivedSocketMessage,
+      socketDelivery,
+    ]);
+    expect(deliveredToAlice).toMatchObject({ senderId: bob.userId, text: "Group socket message" });
+    expect(sentFromSocket).toMatchObject({ senderId: bob.userId, text: "Group socket message" });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(removedMemberReceived).toBe(false);
+
+    const png = await sharp({
+      create: { width: 3, height: 2, channels: 3, background: "#345678" },
+    }).png().toBuffer();
+    const groupImageReceived = new Promise<{ type: string; text: string }>((resolve) => {
+      bobSocket.once("message:new", resolve);
+    });
+    const groupImageResponse = await alice.agent
+      .post(`/api/v1/conversations/${groupId}/messages/image`)
+      .set("x-csrf-token", alice.csrfToken)
+      .field("caption", "Group image")
+      .field("clientId", randomUUID())
+      .attach("image", png, { filename: "group.png", contentType: "image/png" })
+      .expect(201);
+    const groupImageUrl = groupImageResponse.body.message.image.url as string;
+    await expect(groupImageReceived).resolves.toMatchObject({ type: "image", text: "Group image" });
+    await eve.agent.get(groupImageUrl).expect(404);
+
+    const aliceLeave = await alice.agent
+      .post(`/api/v1/conversations/groups/${groupId}/leave`)
+      .set("x-csrf-token", alice.csrfToken)
+      .expect(200);
+    expect(aliceLeave.body.archived).toBe(false);
+    const promotedGroup = await bob.agent.get(`/api/v1/conversations/groups/${groupId}`).expect(200);
+    expect(promotedGroup.body.conversation.currentRole).toBe("admin");
+    await bob.agent
+      .delete(`/api/v1/conversations/groups/${groupId}/members/${dave.userId}`)
+      .set("x-csrf-token", bob.csrfToken)
+      .expect(200);
+    const finalLeave = await bob.agent
+      .post(`/api/v1/conversations/groups/${groupId}/leave`)
+      .set("x-csrf-token", bob.csrfToken)
+      .expect(200);
+    expect(finalLeave.body.archived).toBe(true);
+    await bob.agent.get(`/api/v1/conversations/groups/${groupId}`).expect(404);
+    expect(await Message.countDocuments({ conversationId: groupId })).toBe(4);
+
+    aliceSocket.disconnect();
+    bobSocket.disconnect();
+    eveSocket.disconnect();
+    daveSocket.disconnect();
+  });
+
+  it("secures group photo uploads, replacement, removal, storage cleanup, and realtime updates", async () => {
+    if (!sharedAccounts) throw new Error("Expected private chat test accounts");
+    const { alice, eve } = sharedAccounts;
+    const bob = await loginAccount("bob@example.com");
+    const outsider = await createFixtureAccount("Photo outsider", "photo-outsider@example.com");
+    const groupResponse = await alice.agent
+      .post("/api/v1/conversations/groups")
+      .set("x-csrf-token", alice.csrfToken)
+      .send({ name: "Photo test group", memberIds: [bob.userId, eve.userId] })
+      .expect(201);
+    const groupId = groupResponse.body.conversation.id as string;
+    const photoPath = `/api/v1/conversations/groups/${groupId}/photo`;
+    await alice.agent.get("/api/v1/conversations/groups/not-an-id/photo").expect(400);
+    const directConversation = await Conversation.findOne({ kind: { $ne: "group" } }).select("_id").lean();
+    if (directConversation) {
+      const directPhotoPath = `/api/v1/conversations/groups/${directConversation._id.toString()}/photo`;
+      await alice.agent.get(directPhotoPath).expect(404);
+      await alice.agent
+        .put(directPhotoPath)
+        .set("x-csrf-token", alice.csrfToken)
+        .attach("photo", Buffer.from("ignored"), { filename: "ignored.jpg", contentType: "image/jpeg" })
+        .expect(404);
+    }
+
+    const png = await sharp({
+      create: { width: 80, height: 48, channels: 3, background: "#4765ca" },
+    }).png().toBuffer();
+    const jpeg = await sharp({
+      create: { width: 56, height: 96, channels: 3, background: "#21a277" },
+    }).jpeg().toBuffer();
+
+    await alice.agent
+      .put(photoPath)
+      .attach("photo", png, { filename: "missing-csrf.png", contentType: "image/png" })
+      .expect(403);
+    await bob.agent
+      .put(photoPath)
+      .set("x-csrf-token", bob.csrfToken)
+      .attach("photo", png, { filename: "member.png", contentType: "image/png" })
+      .expect(403);
+    await bob.agent
+      .delete(photoPath)
+      .set("x-csrf-token", bob.csrfToken)
+      .expect(403);
+    await outsider.agent
+      .put(photoPath)
+      .set("x-csrf-token", outsider.csrfToken)
+      .attach("photo", png, { filename: "outsider.png", contentType: "image/png" })
+      .expect(404);
+    await outsider.agent.get(photoPath).expect(404);
+
+    await alice.agent
+      .put(photoPath)
+      .set("x-csrf-token", alice.csrfToken)
+      .attach("photo", Buffer.from("not an image"), { filename: "invalid.png", contentType: "image/png" })
+      .expect(415);
+    const pngSignature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    await alice.agent
+      .put(photoPath)
+      .set("x-csrf-token", alice.csrfToken)
+      .attach("photo", pngSignature, { filename: "damaged.png", contentType: "image/png" })
+      .expect(400);
+    await alice.agent
+      .put(photoPath)
+      .set("x-csrf-token", alice.csrfToken)
+      .attach("photo", Buffer.alloc(env.AVATAR_MAX_UPLOAD_BYTES + 1), {
+        filename: "large.png",
+        contentType: "image/png",
+      })
+      .expect(413);
+
+    const aliceSocket = await connectSocket(alice.cookie);
+    const bobSocket = await connectSocket(bob.cookie);
+    const eveSocket = await connectSocket(eve.cookie);
+    const outsiderSocket = await connectSocket(outsider.cookie);
+    const aliceUpdate = new Promise<{ conversationId: string }>((resolve) => {
+      aliceSocket.once("group:updated", resolve);
+    });
+    const bobUpdate = new Promise<{ conversationId: string }>((resolve) => {
+      bobSocket.once("group:updated", resolve);
+    });
+    let outsiderReceivedUpdate = false;
+    outsiderSocket.on("group:updated", ({ conversationId }: { conversationId: string }) => {
+      if (conversationId === groupId) outsiderReceivedUpdate = true;
+    });
+
+    const uploaded = await alice.agent
+      .put(photoPath)
+      .set("x-csrf-token", alice.csrfToken)
+      .attach("photo", png, { filename: "group.png", contentType: "image/png" })
+      .expect(200);
+    expect(uploaded.body.conversation.photoUrl).toMatch(
+      new RegExp(`^${photoPath.replaceAll("/", "\\/")}\\?v=`),
+    );
+    expect(uploaded.body.conversation.photoReference).toMatch(
+      /^[0-9a-f-]{36}\.webp$/,
+    );
+    expect(await aliceUpdate).toEqual({ conversationId: groupId });
+    expect(await bobUpdate).toEqual({ conversationId: groupId });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(outsiderReceivedUpdate).toBe(false);
+
+    const firstGroup = await Conversation.findById(groupId).lean();
+    const firstKey = firstGroup?.photoReference;
+    if (!firstKey) throw new Error("Group photo was not persisted");
+    expect(existsSync(join(avatarStorageRoot, firstKey))).toBe(true);
+    const memberPhoto = await eve.agent.get(uploaded.body.conversation.photoUrl as string).expect(200);
+    expect(memberPhoto.headers["content-type"]).toContain("image/webp");
+    expect(await sharp(memberPhoto.body as Buffer).metadata()).toMatchObject({
+      format: "webp",
+      width: 512,
+      height: 512,
+    });
+    await request(baseUrl).get(uploaded.body.conversation.photoUrl as string).expect(401);
+
+    await alice.agent
+      .delete(`/api/v1/conversations/groups/${groupId}/members/${eve.userId}`)
+      .set("x-csrf-token", alice.csrfToken)
+      .expect(200);
+    await eve.agent.get(uploaded.body.conversation.photoUrl as string).expect(404);
+    let removedMemberReceivedUpdate = false;
+    eveSocket.on("group:updated", ({ conversationId }: { conversationId: string }) => {
+      if (conversationId === groupId) removedMemberReceivedUpdate = true;
+    });
+    const aliceReplacementUpdate = new Promise<{ conversationId: string }>((resolve) => {
+      aliceSocket.once("group:updated", resolve);
+    });
+    const bobReplacementUpdate = new Promise<{ conversationId: string }>((resolve) => {
+      bobSocket.once("group:updated", resolve);
+    });
+
+    const cleanup = vi.spyOn(avatarService, "deleteAvatarIfUnreferenced")
+      .mockRejectedValueOnce(new Error("simulated storage cleanup failure"));
+    const errorLog = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const replacement = await alice.agent
+      .put(photoPath)
+      .set("x-csrf-token", alice.csrfToken)
+      .attach("photo", jpeg, { filename: "replacement.jpg", contentType: "image/jpeg" })
+      .expect(200);
+    expect(await aliceReplacementUpdate).toEqual({ conversationId: groupId });
+    expect(await bobReplacementUpdate).toEqual({ conversationId: groupId });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(removedMemberReceivedUpdate).toBe(false);
+    cleanup.mockRestore();
+    errorLog.mockRestore();
+
+    const replacedGroup = await Conversation.findById(groupId).lean();
+    const replacementKey = replacedGroup?.photoReference;
+    if (!replacementKey) throw new Error("Replacement group photo was not persisted");
+    expect(replacementKey).not.toBe(firstKey);
+    expect(replacement.body.conversation.photoUrl).not.toBe(uploaded.body.conversation.photoUrl);
+    expect(existsSync(join(avatarStorageRoot, replacementKey))).toBe(true);
+    expect(existsSync(join(avatarStorageRoot, firstKey))).toBe(true);
+    await avatarService.deleteAvatarIfUnreferenced(firstKey);
+    expect(existsSync(join(avatarStorageRoot, firstKey))).toBe(false);
+    await avatarService.cleanupOrphanedAvatars();
+    expect(existsSync(join(avatarStorageRoot, replacementKey))).toBe(true);
+
+    const removed = await alice.agent
+      .delete(photoPath)
+      .set("x-csrf-token", alice.csrfToken)
+      .expect(200);
+    expect(removed.body.conversation.photoReference).toBeNull();
+    expect(removed.body.conversation.photoUrl).toBeNull();
+    expect(existsSync(join(avatarStorageRoot, replacementKey))).toBe(false);
+    await bob.agent.get(uploaded.body.conversation.photoUrl as string).expect(404);
+
+    const brokenKey = `${randomUUID()}.webp`;
+    await Conversation.updateOne({ _id: groupId }, { $set: { photoReference: brokenKey } });
+    const brokenGroup = await alice.agent.get(`/api/v1/conversations/groups/${groupId}`).expect(200);
+    expect(brokenGroup.body.conversation.photoUrl).toContain(encodeURIComponent(brokenKey));
+    await alice.agent.get(brokenGroup.body.conversation.photoUrl as string).expect(404);
+
+    aliceSocket.disconnect();
+    bobSocket.disconnect();
+    eveSocket.disconnect();
+    outsiderSocket.disconnect();
   });
 
   it("validates, persists, serves, replaces, and removes private profile photos", async () => {

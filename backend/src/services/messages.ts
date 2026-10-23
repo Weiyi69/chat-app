@@ -2,18 +2,13 @@ import { Types } from "mongoose";
 
 import { Conversation } from "../models/conversation.js";
 import { Message } from "../models/message.js";
+import { User } from "../models/user.js";
+import { avatarUrlFor } from "./avatars.js";
+import { ChatRequestError } from "./chat-errors.js";
 import { encodeMessageCursor } from "../validators/messages.js";
 import { findConversationForMember } from "./conversations.js";
 
-export class ChatRequestError extends Error {
-  constructor(
-    public readonly status: number,
-    public readonly code: string,
-    message: string,
-  ) {
-    super(message);
-  }
-}
+export { ChatRequestError } from "./chat-errors.js";
 
 export function serializeMessage(message: {
   _id: { toString(): string };
@@ -28,7 +23,7 @@ export function serializeMessage(message: {
     height: number;
   } | null;
   createdAt: Date;
-}) {
+}, sender?: { displayName: string; avatarUrl: string | null }) {
   const serialized = {
     id: message._id.toString(),
     conversationId: message.conversationId.toString(),
@@ -36,6 +31,7 @@ export function serializeMessage(message: {
     type: message.type ?? "text",
     text: message.text ?? "",
     createdAt: message.createdAt.toISOString(),
+    ...(sender ? { sender } : {}),
   };
   if (!message.image) return serialized;
   return {
@@ -48,6 +44,15 @@ export function serializeMessage(message: {
       url: `/api/v1/conversations/${serialized.conversationId}/messages/${serialized.id}/image`,
     },
   };
+}
+
+export async function serializeMessageForDelivery(message: Parameters<typeof serializeMessage>[0]) {
+  const user = await User.findById(message.senderId)
+    .select("displayName +avatarKey +avatarVersion")
+    .lean();
+  return serializeMessage(message, user
+    ? { displayName: user.displayName, avatarUrl: avatarUrlFor(user) }
+    : undefined);
 }
 
 export async function createPersistedMessage(input: {
@@ -147,9 +152,18 @@ export async function getMessagePage(input: {
   const hasMore = documents.length > input.limit;
   const page = documents.slice(0, input.limit);
   const oldest = page.at(-1);
+  const senders = await User.find({ _id: { $in: [...new Set(page.map((message) => message.senderId.toString()))] } })
+    .select("displayName +avatarKey +avatarVersion")
+    .lean();
+  const senderById = new Map(senders.map((sender) => [sender._id.toString(), sender]));
 
   return {
-    messages: page.reverse().map(serializeMessage),
+    messages: page.reverse().map((message) => {
+      const sender = senderById.get(message.senderId.toString());
+      return serializeMessage(message, sender
+        ? { displayName: sender.displayName, avatarUrl: avatarUrlFor(sender) }
+        : undefined);
+    }),
     nextCursor:
       hasMore && oldest
         ? encodeMessageCursor({ createdAt: oldest.createdAt, id: oldest._id.toString() })

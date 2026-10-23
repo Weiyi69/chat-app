@@ -14,7 +14,7 @@ import {
   ChatRequestError,
   createPersistedMessage,
   getMessagePage,
-  serializeMessage,
+  serializeMessageForDelivery,
 } from "../services/messages.js";
 import { objectIdSchema } from "../validators/common.js";
 import {
@@ -77,9 +77,9 @@ messagesRouter.post("/:conversationId/messages", sendLimiter, async (request, re
     text: input.text,
     idempotencyKey: input.clientId,
   });
-  const serialized = serializeMessage(message);
+  const serialized = await serializeMessageForDelivery(message);
 
-  publishMessage(serialized);
+  await publishMessage(serialized);
   response.status(201).json({ message: serialized });
 });
 
@@ -113,8 +113,8 @@ messagesRouter.post(
       idempotencyKey: parsed.data.clientId,
       image: processed,
     });
-    const serialized = serializeMessage(message);
-    publishMessage(serialized);
+    const serialized = await serializeMessageForDelivery(message);
+    await publishMessage(serialized);
     response.status(201).json({ message: serialized });
   },
 );

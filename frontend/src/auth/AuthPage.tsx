@@ -55,7 +55,6 @@ export function AuthPage({ mode }: { mode: "login" | "register" }) {
   return (
     <main className="auth-page">
       <section className="auth-card" aria-labelledby="auth-heading">
-        <img className="brand-mark logo-image" src="/converse-logo.png" alt="Converse logo" />
         <p className="eyebrow">PRIVATE MESSAGES, MADE SIMPLE</p>
         <h1 id="auth-heading">{isRegister ? "Create your account" : "Welcome back"}</h1>
         <p className="auth-subtitle">

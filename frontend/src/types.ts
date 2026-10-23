@@ -11,11 +11,33 @@ export interface SearchUser {
   avatarUrl: string | null;
 }
 
-export interface Conversation {
+export interface DirectConversation {
+  kind?: "direct";
   id: string;
   otherUser: SearchUser;
   latestMessage: { text: string; createdAt: string | null } | null;
 }
+
+export interface GroupMember {
+  userId: string;
+  displayName: string;
+  avatarUrl: string | null;
+  role: "admin" | "member";
+  joinedAt: string;
+}
+
+export interface GroupConversation {
+  kind: "group";
+  id: string;
+  name: string;
+  photoReference: string | null;
+  photoUrl: string | null;
+  currentRole: "admin" | "member";
+  members: GroupMember[];
+  latestMessage: { text: string; createdAt: string | null } | null;
+}
+
+export type Conversation = DirectConversation | GroupConversation;
 
 export interface Message {
   id: string;
@@ -24,6 +46,7 @@ export interface Message {
   type: "text" | "image";
   text: string;
   createdAt: string;
+  sender?: { displayName: string; avatarUrl: string | null };
   image?: {
     contentType: "image/jpeg" | "image/png" | "image/webp";
     size: number;

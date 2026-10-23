@@ -1,6 +1,6 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { AuthPage } from "../src/auth/AuthPage";
@@ -23,6 +23,22 @@ function renderAuthPage(mode: "login" | "register" = "register") {
       <AuthProvider>
         <MemoryRouter>
           <AuthPage mode={mode} />
+        </MemoryRouter>
+      </AuthProvider>
+    </QueryClientProvider>,
+  );
+}
+
+function renderAuthRoutes(initialEntry = "/register") {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return render(
+    <QueryClientProvider client={client}>
+      <AuthProvider>
+        <MemoryRouter initialEntries={[initialEntry]}>
+          <Routes>
+            <Route path="/login" element={<AuthPage mode="login" />} />
+            <Route path="/register" element={<AuthPage mode="register" />} />
+          </Routes>
         </MemoryRouter>
       </AuthProvider>
     </QueryClientProvider>,
@@ -66,13 +82,43 @@ describe("registration form", () => {
   });
 });
 
+describe("login form", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("submits valid login details", async () => {
+    vi.mocked(authApi.login).mockResolvedValue({
+      id: "abc123",
+      displayName: "Ada Lovelace",
+      email: "ada@example.com",
+      avatarUrl: null,
+    });
+    renderAuthPage("login");
+    fireEvent.change(screen.getByLabelText("Email"), { target: { value: "ada@example.com" } });
+    fireEvent.change(screen.getByLabelText("Password"), { target: { value: "correct-horse-battery" } });
+    fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
+
+    await waitFor(() =>
+      expect(authApi.login).toHaveBeenCalledWith({
+        email: "ada@example.com",
+        password: "correct-horse-battery",
+      }),
+    );
+  });
+
+  it("navigates between registration and login pages", async () => {
+    renderAuthRoutes();
+    expect(await screen.findByRole("heading", { name: "Create your account" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("link", { name: "Sign in" }));
+    expect(await screen.findByRole("heading", { name: "Welcome back" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("link", { name: "Create an account" }));
+    expect(await screen.findByRole("heading", { name: "Create your account" })).toBeInTheDocument();
+  });
+});
+
 describe("authentication branding", () => {
-  it.each(["login", "register"] as const)("shows the Converse logo on the %s page", (mode) => {
+  it.each(["login", "register"] as const)("omits the Converse logo on the %s page", (mode) => {
     renderAuthPage(mode);
 
-    expect(screen.getByRole("img", { name: "Converse logo" })).toHaveAttribute(
-      "src",
-      "/converse-logo.png",
-    );
+    expect(screen.queryByRole("img", { name: "Converse logo" })).not.toBeInTheDocument();
   });
 });

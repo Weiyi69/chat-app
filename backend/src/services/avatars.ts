@@ -4,8 +4,9 @@ import { join } from "node:path";
 import sharp from "sharp";
 
 import { avatarStorageRoot, env } from "../config/env.js";
+import { Conversation } from "../models/conversation.js";
 import { User } from "../models/user.js";
-import { ChatRequestError } from "./messages.js";
+import { ChatRequestError } from "./chat-errors.js";
 
 const maxAvatarDimension = 10_000;
 const maxAvatarPixels = 40_000_000;
@@ -130,6 +131,7 @@ export async function deleteAvatar(key: string | null | undefined): Promise<void
 export async function deleteAvatarIfUnreferenced(key: string | null | undefined): Promise<void> {
   if (!key) return;
   if (await User.exists({ avatarKey: key })) return;
+  if (await Conversation.exists({ photoReference: key })) return;
   await deleteAvatar(key);
 }
 
@@ -154,7 +156,10 @@ export async function cleanupOrphanedAvatars(): Promise<void> {
   if (keys.length === 0) return;
 
   const referenced = new Set(
-    (await User.distinct("avatarKey", { avatarKey: { $in: keys } })).filter(
+    [
+      ...(await User.distinct("avatarKey", { avatarKey: { $in: keys } })),
+      ...(await Conversation.distinct("photoReference", { photoReference: { $in: keys } })),
+    ].filter(
       (key): key is string => typeof key === "string",
     ),
   );

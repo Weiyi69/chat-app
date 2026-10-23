@@ -2,7 +2,7 @@ import { useQuery, useQueryClient, type UseQueryResult } from "@tanstack/react-q
 import { useEffect, useRef, useState, type ChangeEvent, type KeyboardEvent } from "react";
 
 import { chatApi } from "../lib/api";
-import type { Conversation, MessagePage } from "../types";
+import type { Conversation, GroupConversation, MessagePage } from "../types";
 import { Avatar, formatDate, formatTime, mergeMessages } from "./chat-utils";
 
 export function ChatView({
@@ -38,6 +38,17 @@ export function ChatView({
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [viewerPath, setViewerPath] = useState<string | null>(null);
+  const [groupDetailsOpen, setGroupDetailsOpen] = useState(false);
+  const [groupNameDraft, setGroupNameDraft] = useState("");
+  const [groupMemberSearch, setGroupMemberSearch] = useState("");
+  const [groupActionError, setGroupActionError] = useState("");
+  const [groupActionBusy, setGroupActionBusy] = useState(false);
+  const [groupPhotoFile, setGroupPhotoFile] = useState<File | null>(null);
+  const [groupPhotoPreviewUrl, setGroupPhotoPreviewUrl] = useState<string | null>(null);
+  const [groupPhotoProgress, setGroupPhotoProgress] = useState(0);
+  const [groupPhotoOperation, setGroupPhotoOperation] = useState<"upload" | "remove" | null>(null);
+  const [groupPhotoError, setGroupPhotoError] = useState("");
+  const [groupPhotoSuccess, setGroupPhotoSuccess] = useState("");
   const idempotencyKey = useRef<string | null>(null);
   const imageIdempotencyKey = useRef<string | null>(null);
   const previewUrlRef = useRef<string | null>(null);
@@ -52,6 +63,26 @@ export function ChatView({
     queryFn: chatApi.imageLimits,
     staleTime: Infinity,
   });
+  const isGroup = conversation.kind === "group";
+  const groupPhotoLimitsQuery = useQuery({
+    queryKey: ["group-photo-limits"],
+    queryFn: chatApi.groupPhotoLimits,
+    staleTime: Infinity,
+    enabled: isGroup,
+  });
+  const groupQuery = useQuery({
+    queryKey: ["group", conversation.id],
+    queryFn: () => chatApi.groupDetails(conversation.id),
+    enabled: isGroup,
+    initialData: isGroup ? conversation : undefined,
+  });
+  const groupMemberSearchQuery = useQuery({
+    queryKey: ["group-member-search", groupMemberSearch],
+    queryFn: () => chatApi.searchUsers(groupMemberSearch, undefined),
+    enabled: isGroup && groupDetailsOpen && groupQuery.data?.currentRole === "admin" && groupMemberSearch.trim().length >= 2,
+  });
+  const groupDetails = isGroup ? groupQuery.data : undefined;
+  const groupPhotoUrl = groupDetails ? groupDetails.photoUrl : isGroup ? conversation.photoUrl : null;
   const page = messagesQuery.data;
   const messages = page?.messages ?? [];
 
@@ -84,6 +115,23 @@ export function ChatView({
     },
     [],
   );
+
+  useEffect(() => {
+    if (!groupPhotoFile) {
+      setGroupPhotoPreviewUrl(null);
+      return;
+    }
+    const url = URL.createObjectURL(groupPhotoFile);
+    setGroupPhotoPreviewUrl(url);
+    return () => URL.revokeObjectURL(url);
+  }, [groupPhotoFile]);
+
+  useEffect(() => {
+    setGroupPhotoFile(null);
+    setGroupPhotoError("");
+    setGroupPhotoSuccess("");
+    setGroupPhotoProgress(0);
+  }, [conversation.id]);
 
   function clearSelectedImage() {
     if (previewUrlRef.current) URL.revokeObjectURL(previewUrlRef.current);
@@ -180,6 +228,112 @@ export function ChatView({
     }
   }
 
+  async function updateGroup(action: () => Promise<GroupConversation>) {
+    setGroupActionBusy(true);
+    setGroupActionError("");
+    try {
+      const updated = await action();
+      queryClient.setQueryData(["group", conversation.id], updated);
+      await queryClient.invalidateQueries({ queryKey: ["conversations"] });
+    } catch (error) {
+      setGroupActionError(error instanceof Error ? error.message : "Group could not be updated.");
+    } finally {
+      setGroupActionBusy(false);
+    }
+  }
+
+  function updateGroupPhotoCache(updated: GroupConversation) {
+    queryClient.setQueryData(["group", conversation.id], updated);
+    queryClient.setQueryData<Conversation[]>(["conversations"], (current) =>
+      current?.map((item) => item.id === updated.id ? updated : item),
+    );
+    void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+  }
+
+  function selectGroupPhoto(event: ChangeEvent<HTMLInputElement>) {
+    const selected = event.currentTarget.files?.[0] ?? null;
+    event.currentTarget.value = "";
+    if (!selected) return;
+    const maxBytes = groupPhotoLimitsQuery.data?.maxUploadBytes ?? 5 * 1024 * 1024;
+    setGroupPhotoError("");
+    setGroupPhotoSuccess("");
+    if (!["image/jpeg", "image/png", "image/webp"].includes(selected.type)) {
+      setGroupPhotoFile(null);
+      setGroupPhotoError("Choose a JPEG, PNG, or WebP image.");
+      return;
+    }
+    if (selected.size > maxBytes) {
+      setGroupPhotoFile(null);
+      setGroupPhotoError(`Choose an image smaller than ${formatUploadSize(maxBytes)}.`);
+      return;
+    }
+    setGroupPhotoFile(selected);
+    setGroupPhotoProgress(0);
+  }
+
+  async function saveGroupPhoto() {
+    if (!groupPhotoFile || groupPhotoOperation) return;
+    setGroupPhotoOperation("upload");
+    setGroupPhotoError("");
+    setGroupPhotoSuccess("");
+    try {
+      const updated = await chatApi.uploadGroupPhoto(
+        conversation.id,
+        groupPhotoFile,
+        setGroupPhotoProgress,
+      );
+      updateGroupPhotoCache(updated);
+      setGroupPhotoFile(null);
+      setGroupPhotoProgress(0);
+      setGroupPhotoSuccess("Group photo updated.");
+    } catch (error) {
+      setGroupPhotoError(error instanceof Error ? error.message : "Group photo could not be saved. Try again.");
+    } finally {
+      setGroupPhotoOperation(null);
+    }
+  }
+
+  async function removeCurrentGroupPhoto() {
+    if (!groupPhotoUrl || groupPhotoOperation) return;
+    setGroupPhotoOperation("remove");
+    setGroupPhotoError("");
+    setGroupPhotoSuccess("");
+    try {
+      const updated = await chatApi.removeGroupPhoto(conversation.id);
+      updateGroupPhotoCache(updated);
+      setGroupPhotoFile(null);
+      setGroupPhotoProgress(0);
+      setGroupPhotoSuccess("Group photo removed.");
+    } catch (error) {
+      setGroupPhotoError(error instanceof Error ? error.message : "Group photo could not be removed. Try again.");
+    } finally {
+      setGroupPhotoOperation(null);
+    }
+  }
+
+  function cancelGroupPhotoSelection() {
+    setGroupPhotoFile(null);
+    setGroupPhotoProgress(0);
+    setGroupPhotoError("");
+  }
+
+  async function leaveGroup() {
+    setGroupActionBusy(true);
+    setGroupActionError("");
+    try {
+      await chatApi.leaveGroup(conversation.id);
+      await queryClient.invalidateQueries({ queryKey: ["conversations"] });
+      setGroupDetailsOpen(false);
+      onBack();
+    } catch (error) {
+      setGroupActionError(error instanceof Error ? error.message : "Could not leave the group.");
+      setGroupActionBusy(false);
+    }
+  }
+
+  const title = isGroup ? conversation.name : conversation.otherUser.displayName;
+  const maxGroupPhotoBytes = groupPhotoLimitsQuery.data?.maxUploadBytes ?? 5 * 1024 * 1024;
+
   return (
     <div className="chat-view">
       <header className="chat-header">
@@ -187,19 +341,244 @@ export function ChatView({
           ←
         </button>
         <Avatar
-          name={conversation.otherUser.displayName}
-          avatarUrl={conversation.otherUser.avatarUrl}
+          name={title}
+          avatarUrl={isGroup ? groupPhotoUrl : conversation.otherUser.avatarUrl}
           className="large"
+          fallback={isGroup ? "group" : "initial"}
         />
         <div className="chat-contact">
-          <h2>{conversation.otherUser.displayName}</h2>
+          <h2>{title}</h2>
           <span>
             <span className={`status-dot ${socketConnected ? "online" : ""}`} />
-            {socketConnected ? "Available" : "Reconnecting"}
+            {isGroup
+              ? `${groupDetails?.members.length ?? 0} members`
+              : socketConnected ? "Available" : "Reconnecting"}
           </span>
         </div>
+        {isGroup && (
+          <button
+            type="button"
+            className="quiet-button group-details-button"
+            onClick={() => {
+              setGroupDetailsOpen(true);
+              setGroupNameDraft(groupDetails?.name ?? conversation.name);
+              setGroupActionError("");
+            }}
+          >
+            Group details
+          </button>
+        )}
         <div className="chat-header-mark" aria-hidden="true">C</div>
       </header>
+
+      {isGroup && groupDetailsOpen && (
+        <div className="group-details-backdrop">
+          <section className="group-details-dialog" role="dialog" aria-modal="true" aria-labelledby="group-details-title">
+            <header className="group-details-heading">
+              <div>
+                <span className="eyebrow">CONVERSATION</span>
+                <h2 id="group-details-title">Group details</h2>
+              </div>
+              <button
+                type="button"
+                className="quiet-button"
+                onClick={() => setGroupDetailsOpen(false)}
+              >
+                Close
+              </button>
+            </header>
+            {groupQuery.isLoading && <p className="muted-note">Loading group details...</p>}
+            {groupQuery.error && (
+              <div className="error-panel">
+                <p>Group details could not be loaded.</p>
+                <button type="button" className="quiet-button" onClick={() => void groupQuery.refetch()}>
+                  Try again
+                </button>
+              </div>
+            )}
+            {groupDetails && (
+              <>
+                <section className="group-photo-editor" aria-label="Group photo">
+                  {groupPhotoPreviewUrl ? (
+                    <div className="avatar large group-photo-preview">
+                      <img src={groupPhotoPreviewUrl} alt="Preview of selected group photo" />
+                    </div>
+                  ) : (
+                    <Avatar
+                      name={groupDetails.name}
+                      avatarUrl={groupDetails.photoUrl}
+                      className="large"
+                      fallback="group"
+                    />
+                  )}
+                  <div className="group-photo-controls">
+                    <strong>{groupPhotoFile ? "Photo preview" : "Group photo"}</strong>
+                    {groupDetails.currentRole === "admin" && (
+                      <label className="quiet-button group-photo-picker">
+                        <span>{groupPhotoFile || groupDetails.photoUrl ? "Choose a different photo" : "Choose a photo"}</span>
+                        <input
+                          type="file"
+                          accept="image/jpeg,image/png,image/webp"
+                          aria-label="Choose a group photo"
+                          onChange={selectGroupPhoto}
+                          disabled={groupPhotoOperation !== null}
+                        />
+                      </label>
+                    )}
+                    <span className="muted-note">
+                      JPEG, PNG, or WebP. Maximum {formatUploadSize(maxGroupPhotoBytes)}.
+                    </span>
+                  </div>
+                </section>
+                {groupPhotoOperation === "upload" && (
+                  <div className="group-photo-progress">
+                    <progress aria-label="Group photo upload progress" max={100} value={groupPhotoProgress} />
+                    <span role="status">Uploading photo: {groupPhotoProgress}%</span>
+                  </div>
+                )}
+                {groupPhotoLimitsQuery.error && (
+                  <p className="muted-note" role="status">
+                    Upload limits are unavailable; the server will validate the photo.
+                  </p>
+                )}
+                {groupPhotoError && <p className="inline-error" role="alert">{groupPhotoError}</p>}
+                {groupPhotoSuccess && <p className="group-photo-success" role="status">{groupPhotoSuccess}</p>}
+                {groupDetails.currentRole === "admin" && (
+                  <div className="group-photo-actions">
+                    {groupPhotoFile && (
+                      <>
+                        <button
+                          type="button"
+                          className="quiet-button"
+                          onClick={cancelGroupPhotoSelection}
+                          disabled={groupPhotoOperation !== null}
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          type="button"
+                          className="primary-button group-photo-save"
+                          onClick={() => void saveGroupPhoto()}
+                          disabled={groupPhotoOperation !== null}
+                        >
+                          {groupPhotoOperation === "upload" ? "Saving..." : "Save photo"}
+                        </button>
+                      </>
+                    )}
+                    {groupDetails.photoUrl && !groupPhotoFile && (
+                      <button
+                        type="button"
+                        className="quiet-button danger-button"
+                        onClick={() => void removeCurrentGroupPhoto()}
+                        disabled={groupPhotoOperation !== null}
+                      >
+                        {groupPhotoOperation === "remove" ? "Removing..." : "Remove photo"}
+                      </button>
+                    )}
+                  </div>
+                )}
+                {groupDetails.currentRole === "admin" ? (
+                  <form
+                    className="group-rename-form"
+                    onSubmit={(event) => {
+                      event.preventDefault();
+                      void updateGroup(() => chatApi.renameGroup(conversation.id, groupNameDraft.trim()));
+                    }}
+                  >
+                    <label htmlFor="group-name">Group name</label>
+                    <div className="group-inline-action">
+                      <input
+                        id="group-name"
+                        value={groupNameDraft}
+                        maxLength={80}
+                        onChange={(event) => setGroupNameDraft(event.target.value)}
+                      />
+                      <button
+                        type="submit"
+                        className="quiet-button"
+                        disabled={groupActionBusy || !groupNameDraft.trim()}
+                      >
+                        Rename
+                      </button>
+                    </div>
+                  </form>
+                ) : (
+                  <p className="group-details-name">{groupDetails.name}</p>
+                )}
+                <h3>Members ({groupDetails.members.length})</h3>
+                <ul className="group-member-list">
+                  {groupDetails.members.map((member) => (
+                    <li key={member.userId}>
+                      <Avatar name={member.displayName} avatarUrl={member.avatarUrl} />
+                      <span className="group-member-name">
+                        {member.displayName}
+                        {member.userId === currentUserId ? " (you)" : ""}
+                      </span>
+                      <span className="group-member-role">{member.role}</span>
+                      {groupDetails.currentRole === "admin" && member.userId !== currentUserId && (
+                        <button
+                          type="button"
+                          className="quiet-button"
+                          disabled={groupActionBusy}
+                          onClick={() => void updateGroup(() =>
+                            chatApi.removeGroupMember(conversation.id, member.userId))}
+                        >
+                          Remove
+                        </button>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+                {groupDetails.currentRole === "admin" && (
+                  <div className="group-add-members">
+                    <label htmlFor="group-member-search">Add people</label>
+                    <input
+                      id="group-member-search"
+                      value={groupMemberSearch}
+                      onChange={(event) => setGroupMemberSearch(event.target.value)}
+                      placeholder="Find someone..."
+                    />
+                    {groupMemberSearch.trim().length >= 2 && (
+                      <div className="group-member-search-results">
+                        {groupMemberSearchQuery.isLoading && <p className="muted-note">Searching...</p>}
+                        {groupMemberSearchQuery.error && (
+                          <p className="inline-error">People search is unavailable.</p>
+                        )}
+                        {groupMemberSearchQuery.data?.users.map((person) => {
+                          const alreadyMember = groupDetails.members.some((member) => member.userId === person.id);
+                          return (
+                            <button
+                              key={person.id}
+                              type="button"
+                              className="person-result"
+                              disabled={alreadyMember || groupActionBusy}
+                              onClick={() => void updateGroup(() =>
+                                chatApi.addGroupMembers(conversation.id, [person.id]))}
+                            >
+                              <Avatar name={person.displayName} avatarUrl={person.avatarUrl} />
+                              <span>{person.displayName}</span>
+                              <span className="result-action">{alreadyMember ? "Added" : "+"}</span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                )}
+                {groupActionError && <p className="inline-error" role="alert">{groupActionError}</p>}
+                <button
+                  type="button"
+                  className="quiet-button group-leave-button"
+                  disabled={groupActionBusy}
+                  onClick={() => void leaveGroup()}
+                >
+                  Leave group
+                </button>
+              </>
+            )}
+          </section>
+        </div>
+      )}
 
       {socketError && <p className="connection-banner" role="status">{socketError}</p>}
 
@@ -211,7 +590,7 @@ export function ChatView({
           pinnedToBottom.current = target.scrollHeight - target.scrollTop - target.clientHeight < 80;
         }}
         aria-live="polite"
-        aria-label={`Messages with ${conversation.otherUser.displayName}`}
+        aria-label={isGroup ? `Messages in ${conversation.name}` : `Messages with ${conversation.otherUser.displayName}`}
       >
         {page?.nextCursor && (
           <button
@@ -235,17 +614,23 @@ export function ChatView({
         {!messagesQuery.isLoading && !messagesQuery.error && messages.length === 0 && (
           <div className="first-message">
             <Avatar
-              name={conversation.otherUser.displayName}
-              avatarUrl={conversation.otherUser.avatarUrl}
+              name={title}
+              avatarUrl={isGroup ? groupPhotoUrl : conversation.otherUser.avatarUrl}
               className="large"
+              fallback={isGroup ? "group" : "initial"}
             />
-            <h3>Say hello to {conversation.otherUser.displayName.split(" ")[0]}.</h3>
+            <h3>{isGroup ? `Say hello to ${conversation.name}.` : `Say hello to ${conversation.otherUser.displayName.split(" ")[0]}.`}</h3>
             <p>This is the beginning of your conversation.</p>
           </div>
         )}
         {messages.map((message, index) => {
           const own = message.senderId === currentUserId;
           const image = message.image;
+          const groupMember = groupDetails?.members.find((member) => member.userId === message.senderId);
+          const senderName = message.sender?.displayName ?? groupMember?.displayName ??
+            (isGroup ? "Group member" : conversation.otherUser.displayName);
+          const senderAvatar = message.sender?.avatarUrl ?? groupMember?.avatarUrl ??
+            (isGroup ? null : conversation.otherUser.avatarUrl);
           const showDate =
             index === 0 ||
             new Date(messages[index - 1].createdAt).toDateString() !==
@@ -255,9 +640,10 @@ export function ChatView({
               {showDate && <div className="date-divider">{formatDate(message.createdAt)}</div>}
               <div className={`message-row ${own ? "own" : ""}`}>
                 {!own && (
-                  <Avatar name={conversation.otherUser.displayName} avatarUrl={conversation.otherUser.avatarUrl} />
+                  <Avatar name={senderName} avatarUrl={senderAvatar} />
                 )}
                 <div className={`message-content ${own ? "own" : ""}`}>
+                  {isGroup && <span className="group-message-sender">{senderName}</span>}
                   {message.type === "image" && image ? (
                     <div className={`message-bubble image-message-bubble ${own ? "own" : ""}`}>
                       <MessageImage
@@ -275,6 +661,7 @@ export function ChatView({
                   )}
                   <time>{formatTime(message.createdAt)}</time>
                 </div>
+                {isGroup && own && <Avatar name={senderName} avatarUrl={senderAvatar} />}
               </div>
             </div>
           );

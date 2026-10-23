@@ -1,4 +1,4 @@
-import type { Conversation, Message, MessagePage, SearchUser, User } from "../types";
+import type { Conversation, GroupConversation, Message, MessagePage, SearchUser, User } from "../types";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:4000";
 
@@ -129,6 +129,57 @@ function uploadImage(
   );
 }
 
+function uploadGroupPhoto(
+  groupId: string,
+  file: File,
+  onProgress: (progress: number) => void,
+): Promise<GroupConversation> {
+  return ensureCsrfToken().then((token) =>
+    new Promise<GroupConversation>((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      const form = new FormData();
+      form.append("photo", file);
+      xhr.open(
+        "PUT",
+        `${API_BASE}/api/v1/conversations/groups/${encodeURIComponent(groupId)}/photo`,
+      );
+      xhr.withCredentials = true;
+      xhr.setRequestHeader("x-csrf-token", token);
+      xhr.upload.addEventListener("progress", (event) => {
+        if (event.lengthComputable) onProgress(Math.round((event.loaded / event.total) * 100));
+      });
+      xhr.addEventListener("load", () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          try {
+            resolve((JSON.parse(xhr.responseText) as { conversation: GroupConversation }).conversation);
+          } catch {
+            reject(new ApiError("The server returned an invalid response", xhr.status, "INVALID_RESPONSE"));
+          }
+          return;
+        }
+        let payload: { error?: { code?: string; message?: string } } = {};
+        try {
+          payload = JSON.parse(xhr.responseText) as typeof payload;
+        } catch {
+          // Use the generic request error below when the server did not return JSON.
+        }
+        if (xhr.status === 403 && payload.error?.code === "CSRF_INVALID") csrfToken = undefined;
+        reject(
+          new ApiError(
+            payload.error?.message ?? "Group photo could not be saved",
+            xhr.status,
+            payload.error?.code ?? "REQUEST_FAILED",
+          ),
+        );
+      });
+      xhr.addEventListener("error", () => {
+        reject(new ApiError("Network error while uploading group photo", 0, "NETWORK_ERROR"));
+      });
+      xhr.send(form);
+    }),
+  );
+}
+
 async function loadPrivateImage(
   path: string,
   signal: AbortSignal,
@@ -218,6 +269,9 @@ export const chatApi = {
   imageLimits: async () => (await apiRequest<{
     image: { maxUploadBytes: number; contentTypes: string[] };
   }>("/limits")).image,
+  groupPhotoLimits: async () => (await apiRequest<{
+    avatar: { maxUploadBytes: number; contentTypes: string[] };
+  }>("/limits")).avatar,
   conversations: async () =>
     (await apiRequest<{ conversations: Conversation[] }>("/conversations")).conversations,
   searchUsers: (search: string, cursor?: string) => {
@@ -232,6 +286,41 @@ export const chatApi = {
       method: "POST",
       body: JSON.stringify({ otherUserId }),
     })).conversation,
+  createGroup: async (name: string, memberIds: string[]) =>
+    (await apiRequest<{ conversation: GroupConversation }>("/conversations/groups", {
+      method: "POST",
+      body: JSON.stringify({ name, memberIds }),
+    })).conversation,
+  groupDetails: async (groupId: string) =>
+    (await apiRequest<{ conversation: GroupConversation }>(
+      `/conversations/groups/${encodeURIComponent(groupId)}`,
+    )).conversation,
+  uploadGroupPhoto,
+  removeGroupPhoto: async (groupId: string) =>
+    (await apiRequest<{ conversation: GroupConversation }>(
+      `/conversations/groups/${encodeURIComponent(groupId)}/photo`,
+      { method: "DELETE" },
+    )).conversation,
+  renameGroup: async (groupId: string, name: string) =>
+    (await apiRequest<{ conversation: GroupConversation }>(
+      `/conversations/groups/${encodeURIComponent(groupId)}`,
+      { method: "PATCH", body: JSON.stringify({ name }) },
+    )).conversation,
+  addGroupMembers: async (groupId: string, memberIds: string[]) =>
+    (await apiRequest<{ conversation: GroupConversation }>(
+      `/conversations/groups/${encodeURIComponent(groupId)}/members`,
+      { method: "POST", body: JSON.stringify({ memberIds }) },
+    )).conversation,
+  removeGroupMember: async (groupId: string, memberId: string) =>
+    (await apiRequest<{ conversation: GroupConversation }>(
+      `/conversations/groups/${encodeURIComponent(groupId)}/members/${encodeURIComponent(memberId)}`,
+      { method: "DELETE" },
+    )).conversation,
+  leaveGroup: (groupId: string) =>
+    apiRequest<{ id: string; archived: boolean }>(
+      `/conversations/groups/${encodeURIComponent(groupId)}/leave`,
+      { method: "POST" },
+    ),
   messages: (conversationId: string, before?: string) => {
     const query = new URLSearchParams({ limit: "40" });
     if (before) query.set("before", before);
