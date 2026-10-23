@@ -22,18 +22,43 @@ export function serializeMessage(message: {
     width: number;
     height: number;
   } | null;
+  replyToMessageId?: { toString(): string } | null;
+  forwardedFrom?: {
+    senderName: string;
+    createdAt: Date;
+  } | null;
+  pinnedAt?: Date | null;
   createdAt: Date;
-}, sender?: { displayName: string; avatarUrl: string | null }) {
+  editedAt?: Date | null;
+  deletedAt?: Date | null;
+  __v?: number;
+}, sender?: { displayName: string; avatarUrl: string | null }, reply?: {
+  id: string;
+  senderName: string;
+  text: string;
+  type: string;
+} | null) {
+  const isDeleted = Boolean(message.deletedAt);
   const serialized = {
     id: message._id.toString(),
     conversationId: message.conversationId.toString(),
     senderId: message.senderId.toString(),
     type: message.type ?? "text",
-    text: message.text ?? "",
+    text: isDeleted ? "This message was deleted." : message.text ?? "",
     createdAt: message.createdAt.toISOString(),
+    revision: message.__v ?? 0,
+    ...(message.editedAt ? { editedAt: message.editedAt.toISOString() } : {}),
+    ...(message.deletedAt ? { deletedAt: message.deletedAt.toISOString() } : {}),
+    ...(message.replyToMessageId
+      ? { reply: reply ?? { id: message.replyToMessageId.toString(), senderName: "Original message", text: "Original message unavailable", type: "text" } }
+      : {}),
+    ...(message.forwardedFrom
+      ? { forwardedFrom: { senderName: message.forwardedFrom.senderName, createdAt: message.forwardedFrom.createdAt.toISOString() } }
+      : {}),
+    ...(message.pinnedAt ? { pinnedAt: message.pinnedAt.toISOString() } : {}),
     ...(sender ? { sender } : {}),
   };
-  if (!message.image) return serialized;
+  if (isDeleted || !message.image) return serialized;
   return {
     ...serialized,
     image: {
@@ -47,12 +72,33 @@ export function serializeMessage(message: {
 }
 
 export async function serializeMessageForDelivery(message: Parameters<typeof serializeMessage>[0]) {
-  const user = await User.findById(message.senderId)
-    .select("displayName +avatarKey +avatarVersion")
-    .lean();
+  const [user, replyMessage] = await Promise.all([
+    User.findById(message.senderId).select("displayName +avatarKey +avatarVersion").lean(),
+    message.replyToMessageId
+      ? Message.findOne({
+          _id: message.replyToMessageId,
+          conversationId: message.conversationId,
+        }).select("_id senderId type text deletedAt").lean()
+      : Promise.resolve(null),
+  ]);
+  const replySender = replyMessage
+    ? await User.findById(replyMessage.senderId).select("displayName").lean()
+    : null;
+  const reply = replyMessage
+    ? {
+        id: replyMessage._id.toString(),
+        senderName: replySender?.displayName ?? "Former member",
+        text: replyMessage.deletedAt
+          ? DELETED_MESSAGE_TEXT
+          : replyMessage.type === "image"
+            ? (replyMessage.text || "Photo")
+            : replyMessage.text || "",
+        type: replyMessage.type ?? "text",
+      }
+    : null;
   return serializeMessage(message, user
     ? { displayName: user.displayName, avatarUrl: avatarUrlFor(user) }
-    : undefined);
+    : undefined, reply);
 }
 
 export async function createPersistedMessage(input: {
@@ -68,10 +114,26 @@ export async function createPersistedMessage(input: {
     height: number;
     sha256: string;
   };
+  replyToMessageId?: string;
+  forwardedFrom?: {
+    originalConversationId: string;
+    originalMessageId: string;
+    senderName: string;
+    createdAt: Date;
+  };
 }) {
   const conversation = await findConversationForMember(input.conversationId, input.senderId);
-  if (!conversation) {
+  if (!conversation || conversation.archivedAt) {
     throw new ChatRequestError(404, "CONVERSATION_NOT_FOUND", "Conversation not found");
+  }
+  if (input.replyToMessageId) {
+    const replyMessage = await Message.findOne({
+      _id: new Types.ObjectId(input.replyToMessageId),
+      conversationId: conversation._id,
+    }).select("_id").lean();
+    if (!replyMessage) {
+      throw new ChatRequestError(404, "REPLY_NOT_FOUND", "Reply target not found");
+    }
   }
 
   let message;
@@ -83,6 +145,17 @@ export async function createPersistedMessage(input: {
       text: input.text,
       image: input.image,
       idempotencyKey: input.idempotencyKey,
+      ...(input.replyToMessageId ? { replyToMessageId: new Types.ObjectId(input.replyToMessageId) } : {}),
+      ...(input.forwardedFrom
+        ? {
+            forwardedFrom: {
+              originalConversationId: new Types.ObjectId(input.forwardedFrom.originalConversationId),
+              originalMessageId: new Types.ObjectId(input.forwardedFrom.originalMessageId),
+              senderName: input.forwardedFrom.senderName,
+              createdAt: input.forwardedFrom.createdAt,
+            },
+          }
+        : {}),
     });
   } catch (error) {
     if (!(typeof error === "object" && error !== null && "code" in error && error.code === 11000)) {
@@ -99,7 +172,12 @@ export async function createPersistedMessage(input: {
     const sameImage = input.image
       ? message.image?.sha256 === input.image.sha256
       : !message.image;
-    if (message.text !== input.text || !sameType || !sameImage) {
+    const sameReply = message.replyToMessageId?.toString() === input.replyToMessageId;
+    const sameForward = input.forwardedFrom
+      ? message.forwardedFrom?.originalConversationId.toString() === input.forwardedFrom.originalConversationId &&
+        message.forwardedFrom?.originalMessageId.toString() === input.forwardedFrom.originalMessageId
+      : !message.forwardedFrom;
+    if (message.text !== input.text || !sameType || !sameImage || !sameReply || !sameForward) {
       throw new ChatRequestError(409, "IDEMPOTENCY_CONFLICT", "Message retry does not match the original");
     }
   }
@@ -157,18 +235,235 @@ export async function getMessagePage(input: {
     .lean();
   const senderById = new Map(senders.map((sender) => [sender._id.toString(), sender]));
 
+  const orderedPage = page.reverse();
+  const replyIds = orderedPage.flatMap((message) => message.replyToMessageId ? [message.replyToMessageId] : []);
+  const replies = await Message.find({
+    _id: { $in: replyIds },
+    conversationId: new Types.ObjectId(input.conversationId),
+  }).select("_id senderId type text deletedAt").lean();
+  const replyById = new Map(replies.map((reply) => [reply._id.toString(), reply]));
+  const replySenders = await User.find({ _id: { $in: [...new Set(replies.map((reply) => reply.senderId.toString()))] } })
+    .select("displayName")
+    .lean();
+  const replySenderById = new Map(replySenders.map((sender) => [sender._id.toString(), sender.displayName]));
+
   return {
-    messages: page.reverse().map((message) => {
+    messages: orderedPage.map((message) => {
       const sender = senderById.get(message.senderId.toString());
+      const replyMessage = message.replyToMessageId
+        ? replyById.get(message.replyToMessageId.toString())
+        : undefined;
+      const reply = replyMessage
+        ? {
+            id: replyMessage._id.toString(),
+            senderName: replySenderById.get(replyMessage.senderId.toString()) ?? "Former member",
+            text: replyMessage.deletedAt
+              ? DELETED_MESSAGE_TEXT
+              : replyMessage.type === "image"
+                ? (replyMessage.text || "Photo")
+                : replyMessage.text || "",
+            type: replyMessage.type ?? "text",
+          }
+        : null;
       return serializeMessage(message, sender
         ? { displayName: sender.displayName, avatarUrl: avatarUrlFor(sender) }
-        : undefined);
+        : undefined, reply);
     }),
     nextCursor:
       hasMore && oldest
         ? encodeMessageCursor({ createdAt: oldest.createdAt, id: oldest._id.toString() })
         : null,
   };
+}
+
+export const DELETED_MESSAGE_TEXT = "This message was deleted.";
+
+async function requireOwnMutableMessage(input: {
+  conversationId: string;
+  messageId: string;
+  userId: string;
+}) {
+  const conversation = await findConversationForMember(input.conversationId, input.userId);
+  if (!conversation || conversation.archivedAt) {
+    throw new ChatRequestError(404, "CONVERSATION_NOT_FOUND", "Conversation not found");
+  }
+  const message = await Message.findOne({
+    _id: new Types.ObjectId(input.messageId),
+    conversationId: conversation._id,
+    senderId: new Types.ObjectId(input.userId),
+  });
+  if (!message) {
+    throw new ChatRequestError(404, "MESSAGE_NOT_FOUND", "Message not found");
+  }
+  return { conversation, message };
+}
+
+async function updateLatestMessagePreview(
+  conversationId: Types.ObjectId,
+  messageId: Types.ObjectId,
+  text: string,
+  previousText?: string,
+) {
+  const latestFilter = previousText === undefined
+    ? [{ lastMessageId: messageId }]
+    : [
+        { lastMessageId: messageId },
+        { lastMessageId: null, lastMessageText: previousText },
+      ];
+  await Conversation.updateOne(
+    { _id: conversationId, $or: latestFilter },
+    { $set: { lastMessageText: text.slice(0, 200) } },
+  );
+}
+
+export async function editOwnMessage(input: {
+  conversationId: string;
+  messageId: string;
+  userId: string;
+  text: string;
+  revision: number;
+}) {
+  const { conversation, message } = await requireOwnMutableMessage(input);
+  if (message.type !== "text") {
+    throw new ChatRequestError(400, "MESSAGE_NOT_EDITABLE", "Only text messages can be edited");
+  }
+  if (message.deletedAt) {
+    throw new ChatRequestError(409, "MESSAGE_DELETED", "Deleted messages cannot be edited");
+  }
+  if ((message.__v ?? 0) !== input.revision) {
+    throw new ChatRequestError(409, "MESSAGE_CHANGED", "Message changed before the edit was saved. Reload and retry.");
+  }
+
+  const editedAt = new Date();
+  const versionFilter = message.__v === undefined
+    ? { __v: { $exists: false } }
+    : { __v: message.__v };
+  const updated = await Message.findOneAndUpdate(
+    {
+      _id: message._id,
+      conversationId: conversation._id,
+      senderId: new Types.ObjectId(input.userId),
+      type: "text",
+      deletedAt: { $exists: false },
+      ...versionFilter,
+    },
+    { $set: { text: input.text, editedAt }, $inc: { __v: 1 } },
+    { new: true, runValidators: true },
+  );
+  if (!updated) {
+    throw new ChatRequestError(409, "MESSAGE_CHANGED", "Message changed before the edit was saved. Reload and retry.");
+  }
+  await updateLatestMessagePreview(
+    conversation._id,
+    updated._id,
+    updated.text,
+    message.text.slice(0, 200),
+  );
+  return updated;
+}
+
+export async function deleteOwnMessage(input: {
+  conversationId: string;
+  messageId: string;
+  userId: string;
+  revision: number;
+}) {
+  const { conversation, message } = await requireOwnMutableMessage(input);
+  if (message.deletedAt) return { message, changed: false };
+  if ((message.__v ?? 0) !== input.revision) {
+    throw new ChatRequestError(409, "MESSAGE_CHANGED", "Message changed before deletion. Reload and retry.");
+  }
+
+  const deletedAt = new Date();
+  const versionFilter = message.__v === undefined
+    ? { __v: { $exists: false } }
+    : { __v: message.__v };
+  const deleted = await Message.findOneAndUpdate(
+    {
+      _id: message._id,
+      conversationId: conversation._id,
+      senderId: new Types.ObjectId(input.userId),
+      deletedAt: { $exists: false },
+      ...versionFilter,
+    },
+    { $set: { text: DELETED_MESSAGE_TEXT, deletedAt }, $inc: { __v: 1 } },
+    { new: true, runValidators: true },
+  );
+  if (!deleted) {
+    const current = await Message.findOne({
+      _id: message._id,
+      conversationId: conversation._id,
+      senderId: new Types.ObjectId(input.userId),
+    });
+    if (current?.deletedAt) return { message: current, changed: false };
+    throw new ChatRequestError(409, "MESSAGE_CHANGED", "Message changed before deletion. Reload and retry.");
+  }
+  await updateLatestMessagePreview(
+    conversation._id,
+    deleted._id,
+    DELETED_MESSAGE_TEXT,
+    (message.text || "[Image]").slice(0, 200),
+  );
+  return { message: deleted, changed: true };
+}
+
+export async function setMessagePinned(input: {
+  conversationId: string;
+  messageId: string;
+  userId: string;
+  pinned: boolean;
+}) {
+  const conversation = await findConversationForMember(input.conversationId, input.userId);
+  if (!conversation || conversation.archivedAt) {
+    throw new ChatRequestError(404, "CONVERSATION_NOT_FOUND", "Conversation not found");
+  }
+  const current = await Message.findOne({
+    _id: new Types.ObjectId(input.messageId),
+    conversationId: conversation._id,
+  });
+  if (!current) throw new ChatRequestError(404, "MESSAGE_NOT_FOUND", "Message not found");
+  if (current.deletedAt) {
+    throw new ChatRequestError(409, "MESSAGE_DELETED", "Deleted messages cannot be pinned");
+  }
+  if (Boolean(current.pinnedAt) === input.pinned) return { message: current, changed: false };
+
+  const versionFilter = current.__v === undefined
+    ? { __v: { $exists: false } }
+    : { __v: current.__v };
+  const stateFilter = current.pinnedAt
+    ? { pinnedAt: current.pinnedAt }
+    : { pinnedAt: { $exists: false } };
+  const updated = await Message.findOneAndUpdate(
+    {
+      _id: current._id,
+      conversationId: conversation._id,
+      deletedAt: { $exists: false },
+      ...versionFilter,
+      ...stateFilter,
+    },
+    input.pinned
+      ? {
+          $set: { pinnedAt: new Date(), pinnedBy: new Types.ObjectId(input.userId) },
+          $inc: { __v: 1 },
+        }
+      : {
+          $unset: { pinnedAt: 1, pinnedBy: 1 },
+          $inc: { __v: 1 },
+        },
+    { new: true, runValidators: true },
+  );
+  if (updated) return { message: updated, changed: true };
+
+  const latest = await Message.findOne({
+    _id: current._id,
+    conversationId: conversation._id,
+  });
+  if (!latest) throw new ChatRequestError(404, "MESSAGE_NOT_FOUND", "Message not found");
+  if (latest.deletedAt) {
+    throw new ChatRequestError(409, "MESSAGE_DELETED", "Deleted messages cannot be pinned");
+  }
+  if (Boolean(latest.pinnedAt) === input.pinned) return { message: latest, changed: false };
+  throw new ChatRequestError(409, "MESSAGE_CHANGED", "Pin status changed. Refresh and retry.");
 }
 
 function isAfterOrEqual(

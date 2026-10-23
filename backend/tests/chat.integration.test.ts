@@ -515,6 +515,176 @@ describe("private chat integration", () => {
     expect(conflictingRetry.body.error.code).toBe("IDEMPOTENCY_CONFLICT");
     expect(await Message.countDocuments()).toBe(3);
 
+    await alice.agent
+      .patch(`/api/v1/conversations/${conversationId}/messages/${sent.body.message.id}`)
+      .set("x-csrf-token", alice.csrfToken)
+      .send({ text: "   ", revision: sent.body.message.revision })
+      .expect(400);
+    await alice.agent
+      .patch(`/api/v1/conversations/${conversationId}/messages/${sent.body.message.id}`)
+      .set("x-csrf-token", alice.csrfToken)
+      .send({ text: "x".repeat(4001), revision: sent.body.message.revision })
+      .expect(400);
+    await alice.agent
+      .patch(`/api/v1/conversations/${conversationId}/messages/${sent.body.message.id}`)
+      .send({ text: "No CSRF", revision: sent.body.message.revision })
+      .expect(403);
+    await bob.agent
+      .patch(`/api/v1/conversations/${conversationId}/messages/${sent.body.message.id}`)
+      .set("x-csrf-token", bob.csrfToken)
+      .send({ text: "Not mine", revision: sent.body.message.revision })
+      .expect(404);
+    await alice.agent
+      .patch(`/api/v1/conversations/${conversationId}/messages/not-a-message`)
+      .set("x-csrf-token", alice.csrfToken)
+      .send({ text: "Invalid ID", revision: sent.body.message.revision })
+      .expect(400);
+    await alice.agent
+      .patch(`/api/v1/conversations/${conversationId}/messages/${sent.body.message.id}`)
+      .set("x-csrf-token", alice.csrfToken)
+      .send({ text: "Spoof sender", senderId: bob.userId, revision: sent.body.message.revision })
+      .expect(400);
+    const anonymousAgent = request.agent(baseUrl);
+    const anonymousCsrf = await anonymousAgent.get("/api/v1/auth/csrf").expect(200);
+    await anonymousAgent
+      .delete(`/api/v1/conversations/${conversationId}/messages/${sent.body.message.id}`)
+      .set("x-csrf-token", anonymousCsrf.body.token as string)
+      .expect(401);
+    await alice.agent
+      .patch(`/api/v1/conversations/${conversationId}/messages/${imageResponse.body.message.id as string}`)
+      .set("x-csrf-token", alice.csrfToken)
+      .send({ text: "Do not replace image", revision: imageResponse.body.message.revision })
+      .expect(400);
+
+    const concurrentEdits = await Promise.all([
+      alice.agent
+        .patch(`/api/v1/conversations/${conversationId}/messages/${sent.body.message.id}`)
+        .set("x-csrf-token", alice.csrfToken)
+        .send({ text: "First concurrent edit", revision: sent.body.message.revision }),
+      alice.agent
+        .patch(`/api/v1/conversations/${conversationId}/messages/${sent.body.message.id}`)
+        .set("x-csrf-token", alice.csrfToken)
+        .send({ text: "Second concurrent edit", revision: sent.body.message.revision }),
+    ]);
+    expect(concurrentEdits.map((result) => result.status).sort()).toEqual([200, 409]);
+    const concurrentSuccess = concurrentEdits.find((result) => result.status === 200);
+    if (!concurrentSuccess) throw new Error("Expected one concurrent edit to succeed");
+    const editedEvent = new Promise<{ id: string; text: string; editedAt: string }>((resolve) => {
+      bobSocket.once("message:updated", resolve);
+    });
+    const edited = await alice.agent
+      .patch(`/api/v1/conversations/${conversationId}/messages/${sent.body.message.id}`)
+      .set("x-csrf-token", alice.csrfToken)
+      .send({ text: "Edited original message", revision: concurrentSuccess.body.message.revision })
+      .expect(200);
+    expect(edited.body.message).toMatchObject({
+      id: sent.body.message.id,
+      text: "Edited original message",
+    });
+    expect(edited.body.message.editedAt).toBeTruthy();
+    await expect(editedEvent).resolves.toMatchObject({
+      id: sent.body.message.id,
+      text: "Edited original message",
+    });
+    await bob.agent
+      .patch(`/api/v1/conversations/${conversationId}/messages/${sent.body.message.id}`)
+      .set("x-csrf-token", bob.csrfToken)
+      .send({ text: "Forged owner", revision: edited.body.message.revision })
+      .expect(404);
+
+    const deletedEvent = new Promise<{ id: string; text: string; deletedAt: string; image?: unknown }>(
+      (resolve) => bobSocket.once("message:updated", resolve),
+    );
+    const deletedText = await alice.agent
+      .delete(`/api/v1/conversations/${conversationId}/messages/${sent.body.message.id}`)
+      .set("x-csrf-token", alice.csrfToken)
+      .send({ revision: edited.body.message.revision })
+      .expect(200);
+    expect(deletedText.body.message).toMatchObject({
+      id: sent.body.message.id,
+      text: "This message was deleted.",
+      deletedAt: expect.any(String),
+    });
+    expect(deletedText.body.message).not.toHaveProperty("image");
+    await expect(deletedEvent).resolves.toMatchObject({
+      id: sent.body.message.id,
+      text: "This message was deleted.",
+    });
+    await alice.agent
+      .delete(`/api/v1/conversations/${conversationId}/messages/${sent.body.message.id}`)
+      .set("x-csrf-token", alice.csrfToken)
+      .send({ revision: edited.body.message.revision })
+      .expect(200);
+    await bob.agent
+      .delete(`/api/v1/conversations/${conversationId}/messages/${sent.body.message.id}`)
+      .set("x-csrf-token", bob.csrfToken)
+      .send({ revision: deletedText.body.message.revision })
+      .expect(404);
+    await alice.agent
+      .patch(`/api/v1/conversations/${conversationId}/messages/${sent.body.message.id}`)
+      .set("x-csrf-token", alice.csrfToken)
+      .send({ text: "Restore deleted content", revision: deletedText.body.message.revision })
+      .expect(409);
+    const readPositionsAfterDelete = await bob.agent
+      .get(`/api/v1/conversations/${conversationId}/receipts`)
+      .expect(200);
+    expect(readPositionsAfterDelete.body.positions).toContainEqual(expect.objectContaining({
+      userId: bob.userId,
+      messageId: sent.body.message.id,
+    }));
+
+    const imageDeleted = await alice.agent
+      .delete(`/api/v1/conversations/${conversationId}/messages/${imageResponse.body.message.id as string}`)
+      .set("x-csrf-token", alice.csrfToken)
+      .send({ revision: imageResponse.body.message.revision })
+      .expect(200);
+    expect(imageDeleted.body.message).toMatchObject({
+      text: "This message was deleted.",
+      deletedAt: expect.any(String),
+    });
+    expect(imageDeleted.body.message).not.toHaveProperty("image");
+    await bob.agent.get(imagePath).expect(404);
+    await alice.agent
+      .delete(`/api/v1/conversations/${conversationId}/messages/${imageResponse.body.message.id as string}`)
+      .set("x-csrf-token", alice.csrfToken)
+      .send({ revision: imageDeleted.body.message.revision })
+      .expect(200);
+    await cleanupOrphanedImages();
+    await expect(imageStorage.readLocal(imageStorageKey)).resolves.toBeInstanceOf(Buffer);
+    const deletedHistory = await bob.agent
+      .get(`/api/v1/conversations/${conversationId}/messages`)
+      .expect(200);
+    const deletedImageHistoryMessage = deletedHistory.body.messages.find(
+      (message: { id: string }) => message.id === imageResponse.body.message.id,
+    );
+    expect(deletedImageHistoryMessage).toMatchObject({ text: "This message was deleted." });
+    expect(deletedImageHistoryMessage).not.toHaveProperty("image");
+    const deletedTextHistoryMessage = deletedHistory.body.messages.find(
+      (message: { id: string }) => message.id === sent.body.message.id,
+    );
+    expect(deletedTextHistoryMessage).toMatchObject({ text: "This message was deleted." });
+    expect(deletedHistory.body.messages.some(
+      (message: { text: string }) => message.text === "Edited original message",
+    )).toBe(false);
+    const deletedImageRecord = await Message.findById(imageResponse.body.message.id).lean();
+    expect(deletedImageRecord?.image?.storageKey).toBe(imageStorageKey);
+    const latestImagePath = imageWithoutCaption.body.message.image.url as string;
+    const latestImageRecord = await Message.findById(imageWithoutCaption.body.message.id).lean();
+    const latestImageStorageKey = latestImageRecord?.image?.storageKey;
+    if (!latestImageStorageKey) throw new Error("Latest image is missing its storage key");
+    const latestImageDeleted = await alice.agent
+      .delete(`/api/v1/conversations/${conversationId}/messages/${imageWithoutCaption.body.message.id as string}`)
+      .set("x-csrf-token", alice.csrfToken)
+      .send({ revision: imageWithoutCaption.body.message.revision })
+      .expect(200);
+    expect(latestImageDeleted.body.message).not.toHaveProperty("image");
+    await bob.agent.get(latestImagePath).expect(404);
+    const previewAfterDeletingLatest = await bob.agent.get("/api/v1/conversations").expect(200);
+    expect(previewAfterDeletingLatest.body.conversations[0].latestMessage.text)
+      .toBe("This message was deleted.");
+    await cleanupOrphanedImages();
+    await expect(imageStorage.readLocal(latestImageStorageKey)).resolves.toBeInstanceOf(Buffer);
+
     const noBroadcastClientId = "831a1f44-5df9-43b4-88ca-bf6d50eb78f5";
     const createSpy = vi.spyOn(Message, "create").mockRejectedValueOnce(new Error("simulated database failure"));
     let unexpectedBroadcast = false;
@@ -710,6 +880,166 @@ describe("private chat integration", () => {
       text: "Hello group",
       sender: { displayName: "Alice Example" },
     });
+    const directConversation = await Conversation.findOne({
+      kind: "direct",
+      participants: { $all: [new mongoose.Types.ObjectId(alice.userId), new mongoose.Types.ObjectId(bob.userId)] },
+    }).select("_id").lean();
+    if (!directConversation) throw new Error("Expected the Alice-Bob direct conversation");
+    const directId = directConversation._id.toString();
+    expect((await joinConversation(aliceSocket, directId)).ok).toBe(true);
+    expect((await joinConversation(bobSocket, directId)).ok).toBe(true);
+
+    const replied = await bob.agent
+      .post(`/api/v1/conversations/${groupId}/messages`)
+      .set("x-csrf-token", bob.csrfToken)
+      .send({
+        text: "A reply in the group",
+        clientId: randomUUID(),
+        replyToMessageId: firstMessage.body.message.id,
+      })
+      .expect(201);
+    expect(replied.body.message.reply).toMatchObject({
+      id: firstMessage.body.message.id,
+      senderName: "Alice Example",
+      text: "Hello group",
+      type: "text",
+    });
+    const directMessageForReply = await Message.findOne({
+      conversationId: directId,
+      senderId: new mongoose.Types.ObjectId(alice.userId),
+      deletedAt: { $exists: false },
+    }).select("_id __v").lean();
+    if (!directMessageForReply) throw new Error("Expected an Alice direct message for cross-conversation test");
+    await alice.agent
+      .post(`/api/v1/conversations/${groupId}/messages`)
+      .set("x-csrf-token", alice.csrfToken)
+      .send({
+        text: "Cross-conversation reply",
+        clientId: randomUUID(),
+        replyToMessageId: directMessageForReply._id.toString(),
+      })
+      .expect(404);
+
+    const pinUpdate = new Promise<{ id: string; pinnedAt?: string }>((resolve) => {
+      bobSocket.once("message:updated", resolve);
+    });
+    const [pinned, simultaneousPin] = await Promise.all([
+      bob.agent
+        .put(`/api/v1/conversations/${groupId}/messages/${firstMessage.body.message.id}/pin`)
+        .set("x-csrf-token", bob.csrfToken)
+        .send({ pinned: true })
+        .expect(200),
+      alice.agent
+        .put(`/api/v1/conversations/${groupId}/messages/${firstMessage.body.message.id}/pin`)
+        .set("x-csrf-token", alice.csrfToken)
+        .send({ pinned: true })
+        .expect(200),
+    ]);
+    expect(pinned.body.message.pinnedAt).toBeTruthy();
+    expect(simultaneousPin.body.message.pinnedAt).toBe(pinned.body.message.pinnedAt);
+    await expect(pinUpdate).resolves.toMatchObject({
+      id: firstMessage.body.message.id,
+      pinnedAt: pinned.body.message.pinnedAt,
+    });
+    const pinnedAt = pinned.body.message.pinnedAt;
+    const duplicatePin = await alice.agent
+      .put(`/api/v1/conversations/${groupId}/messages/${firstMessage.body.message.id}/pin`)
+      .set("x-csrf-token", alice.csrfToken)
+      .send({ pinned: true })
+      .expect(200);
+    expect(duplicatePin.body.message.pinnedAt).toBe(pinnedAt);
+    await dave.agent
+      .put(`/api/v1/conversations/${groupId}/messages/${firstMessage.body.message.id}/pin`)
+      .set("x-csrf-token", dave.csrfToken)
+      .send({ pinned: true })
+      .expect(404);
+    await bob.agent
+      .put(`/api/v1/conversations/${groupId}/messages/${firstMessage.body.message.id}/pin`)
+      .set("x-csrf-token", bob.csrfToken)
+      .send({ pinned: false })
+      .expect(200);
+
+    const forwardedEvent = new Promise<{ conversationId: string; senderId: string; forwardedFrom?: { senderName: string } }>(
+      (resolve) => aliceSocket.once("message:new", resolve),
+    );
+    const forwardClientId = randomUUID();
+    const forwarded = await bob.agent
+      .post(`/api/v1/conversations/${groupId}/messages/${firstMessage.body.message.id}/forward`)
+      .set("x-csrf-token", bob.csrfToken)
+      .send({ destinationConversationId: directId, clientId: forwardClientId })
+      .expect(201);
+    expect(forwarded.body.message).toMatchObject({
+      conversationId: directId,
+      senderId: bob.userId,
+      text: "Hello group",
+      forwardedFrom: { senderName: "Alice Example" },
+    });
+    const forwardedRetry = await bob.agent
+      .post(`/api/v1/conversations/${groupId}/messages/${firstMessage.body.message.id}/forward`)
+      .set("x-csrf-token", bob.csrfToken)
+      .send({ destinationConversationId: directId, clientId: forwardClientId })
+      .expect(201);
+    expect(forwardedRetry.body.message.id).toBe(forwarded.body.message.id);
+    await expect(forwardedEvent).resolves.toMatchObject({
+      conversationId: directId,
+      senderId: bob.userId,
+      forwardedFrom: { senderName: "Alice Example" },
+    });
+    const forwardHistory = await alice.agent.get(`/api/v1/conversations/${directId}/messages`).expect(200);
+    expect(forwardHistory.body.messages.some((message: { id: string }) => message.id === forwarded.body.message.id))
+      .toBe(true);
+    for (let requestIndex = 0; requestIndex < 18; requestIndex += 1) {
+      await bob.agent
+        .post(`/api/v1/conversations/${groupId}/messages/${firstMessage.body.message.id}/forward`)
+        .set("x-csrf-token", bob.csrfToken)
+        .send({
+          destinationConversationId: directId,
+          clientId: "3f902224-d622-49b7-9f7f-b57ab0471d26",
+        })
+        .expect(201);
+    }
+    const blockedForward = await bob.agent
+      .post(`/api/v1/conversations/${groupId}/messages/${firstMessage.body.message.id}/forward`)
+      .set("x-csrf-token", bob.csrfToken)
+      .send({
+        destinationConversationId: directId,
+        clientId: randomUUID(),
+        userId: alice.userId,
+      })
+      .expect(429);
+    expect(blockedForward.body).toEqual({
+      error: {
+        code: "RATE_LIMITED",
+        message: "Too many forwards. Please try again in a minute.",
+      },
+    });
+    const isolatedForward = await alice.agent
+      .post(`/api/v1/conversations/${groupId}/messages/${firstMessage.body.message.id}/forward`)
+      .set("x-csrf-token", alice.csrfToken)
+      .send({ destinationConversationId: directId, clientId: randomUUID() })
+      .expect(201);
+    expect(isolatedForward.body.message.senderId).toBe(alice.userId);
+    await eve.agent
+      .post(`/api/v1/conversations/${groupId}/messages/${firstMessage.body.message.id}/forward`)
+      .set("x-csrf-token", eve.csrfToken)
+      .send({ destinationConversationId: directId, clientId: randomUUID() })
+      .expect(404);
+    await dave.agent
+      .post(`/api/v1/conversations/${groupId}/messages/${firstMessage.body.message.id}/forward`)
+      .set("x-csrf-token", dave.csrfToken)
+      .send({ destinationConversationId: directId, clientId: randomUUID() })
+      .expect(404);
+
+    const directMessage = await Message.findOne({
+      conversationId: { $ne: new mongoose.Types.ObjectId(groupId) },
+      senderId: new mongoose.Types.ObjectId(alice.userId),
+    }).select("_id __v").lean();
+    if (!directMessage) throw new Error("Expected an Alice direct message for cross-conversation test");
+    await alice.agent
+      .patch(`/api/v1/conversations/${groupId}/messages/${directMessage._id.toString()}`)
+      .set("x-csrf-token", alice.csrfToken)
+      .send({ text: "Cross-conversation edit", revision: directMessage.__v ?? 0 })
+      .expect(404);
     await expect(updateReadPosition(bobSocket, groupId, firstMessage.body.message.id)).resolves.toMatchObject({
       ok: true,
     });
@@ -745,6 +1075,11 @@ describe("private chat integration", () => {
       .expect(200);
     await eve.agent.get(`/api/v1/conversations/groups/${groupId}`).expect(404);
     await eve.agent.get(`/api/v1/conversations/${groupId}/messages`).expect(404);
+    await eve.agent
+      .put(`/api/v1/conversations/${groupId}/messages/${firstMessage.body.message.id}/pin`)
+      .set("x-csrf-token", eve.csrfToken)
+      .send({ pinned: true })
+      .expect(404);
     await eve.agent
       .post(`/api/v1/conversations/${groupId}/messages`)
       .set("x-csrf-token", eve.csrfToken)
@@ -784,6 +1119,44 @@ describe("private chat integration", () => {
     ]);
     const monotonicReceipts = await bob.agent.get(`/api/v1/conversations/${groupId}/receipts`).expect(200);
     expect(monotonicReceipts.body.positions).toContainEqual(expect.objectContaining({
+      userId: bob.userId,
+      messageId: currentMembersMessage.body.message.id,
+    }));
+    await bob.agent
+      .patch(`/api/v1/conversations/${groupId}/messages/${currentMembersMessage.body.message.id as string}`)
+      .set("x-csrf-token", bob.csrfToken)
+      .send({ text: "Not the sender's message", revision: currentMembersMessage.body.message.revision })
+      .expect(404);
+    await bob.agent
+      .post(`/api/v1/conversations/${groupId}/messages`)
+      .set("x-csrf-token", bob.csrfToken)
+      .send({
+        text: "Reply to a message that will be deleted",
+        clientId: randomUUID(),
+        replyToMessageId: currentMembersMessage.body.message.id,
+      })
+      .expect(201);
+    const groupDeletion = await alice.agent
+      .delete(`/api/v1/conversations/${groupId}/messages/${currentMembersMessage.body.message.id as string}`)
+      .set("x-csrf-token", alice.csrfToken)
+      .send({ revision: currentMembersMessage.body.message.revision })
+      .expect(200);
+    expect(groupDeletion.body.message.text).toBe("This message was deleted.");
+    const historyAfterReplyTargetDeletion = await bob.agent
+      .get(`/api/v1/conversations/${groupId}/messages`)
+      .expect(200);
+    expect(historyAfterReplyTargetDeletion.body.messages.find(
+      (message: { text: string }) => message.text === "Reply to a message that will be deleted",
+    )?.reply).toMatchObject({ text: "This message was deleted." });
+    await alice.agent
+      .post(`/api/v1/conversations/${groupId}/messages/${currentMembersMessage.body.message.id as string}/forward`)
+      .set("x-csrf-token", alice.csrfToken)
+      .send({ destinationConversationId: directId, clientId: randomUUID() })
+      .expect(404);
+    const groupReceiptAfterDelete = await bob.agent
+      .get(`/api/v1/conversations/${groupId}/receipts`)
+      .expect(200);
+    expect(groupReceiptAfterDelete.body.positions).toContainEqual(expect.objectContaining({
       userId: bob.userId,
       messageId: currentMembersMessage.body.message.id,
     }));
@@ -861,6 +1234,69 @@ describe("private chat integration", () => {
       .expect(200);
     expect(groupImageReaders.body.readers).toContainEqual(expect.objectContaining({ userId: bob.userId }));
     await eve.agent.get(groupImageUrl).expect(404);
+    const imageReadSpy = vi.spyOn(imageStorage, "read");
+    try {
+      await bob.agent
+        .post(`/api/v1/conversations/${groupId}/messages/${groupImageResponse.body.message.id as string}/forward`)
+        .set("x-csrf-token", bob.csrfToken)
+        .send({ destinationConversationId: directId, clientId: randomUUID() })
+        .expect(429);
+      expect(imageReadSpy).not.toHaveBeenCalled();
+    } finally {
+      imageReadSpy.mockRestore();
+    }
+    let failedCopyStorageKey: string | undefined;
+    const originalPut = imageStorage.put.bind(imageStorage);
+    const putSpy = vi.spyOn(imageStorage, "put").mockImplementation(async (key, ...args) => {
+      failedCopyStorageKey = key;
+      await originalPut(key, ...args);
+    });
+    const createSpy = vi.spyOn(Message, "create").mockRejectedValueOnce(new Error("simulated database failure"));
+    try {
+      await alice.agent
+        .post(`/api/v1/conversations/${groupId}/messages/${groupImageResponse.body.message.id as string}/forward`)
+        .set("x-csrf-token", alice.csrfToken)
+        .send({ destinationConversationId: directId, clientId: randomUUID() })
+        .expect(500);
+    } finally {
+      createSpy.mockRestore();
+      putSpy.mockRestore();
+    }
+    expect(failedCopyStorageKey).toBeTruthy();
+    if (!failedCopyStorageKey) throw new Error("Forwarded image cleanup did not capture its storage key");
+    await expect(imageStorage.readLocal(failedCopyStorageKey)).rejects.toThrow();
+
+    const forwardedImage = await alice.agent
+      .post(`/api/v1/conversations/${groupId}/messages/${groupImageResponse.body.message.id as string}/forward`)
+      .set("x-csrf-token", alice.csrfToken)
+      .send({ destinationConversationId: directId, clientId: randomUUID() })
+      .expect(201);
+    expect(forwardedImage.body.message).toMatchObject({
+      conversationId: directId,
+      senderId: alice.userId,
+      text: "Group image",
+      forwardedFrom: { senderName: "Alice Example" },
+    });
+    expect(forwardedImage.body.message.image.url).toContain(`/conversations/${directId}/messages/`);
+    const [sourceImageRecord, copiedImageRecord] = await Promise.all([
+      Message.findById(groupImageResponse.body.message.id).select("image.storageKey").lean(),
+      Message.findById(forwardedImage.body.message.id).select("image.storageKey").lean(),
+    ]);
+    expect(copiedImageRecord?.image?.storageKey).toBeTruthy();
+    expect(copiedImageRecord?.image?.storageKey).not.toBe(sourceImageRecord?.image?.storageKey);
+    await bob.agent.get(forwardedImage.body.message.image.url as string).expect(200);
+    const deletedSourceImage = await alice.agent
+      .delete(`/api/v1/conversations/${groupId}/messages/${groupImageResponse.body.message.id as string}`)
+      .set("x-csrf-token", alice.csrfToken)
+      .send({ revision: groupImageResponse.body.message.revision })
+      .expect(200);
+    expect(deletedSourceImage.body.message).not.toHaveProperty("image");
+    await alice.agent
+      .post(`/api/v1/conversations/${groupId}/messages/${groupImageResponse.body.message.id as string}/forward`)
+      .set("x-csrf-token", alice.csrfToken)
+      .send({ destinationConversationId: directId, clientId: randomUUID() })
+      .expect(404);
+    await bob.agent.get(forwardedImage.body.message.image.url as string).expect(200);
 
     const aliceLeave = await alice.agent
       .post(`/api/v1/conversations/groups/${groupId}/leave`)
@@ -879,7 +1315,7 @@ describe("private chat integration", () => {
       .expect(200);
     expect(finalLeave.body.archived).toBe(true);
     await bob.agent.get(`/api/v1/conversations/groups/${groupId}`).expect(404);
-    expect(await Message.countDocuments({ conversationId: groupId })).toBe(4);
+    expect(await Message.countDocuments({ conversationId: groupId })).toBe(6);
 
     aliceSocket.disconnect();
     bobSocket.disconnect();

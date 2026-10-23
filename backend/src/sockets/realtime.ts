@@ -128,6 +128,7 @@ export function attachSocketServer(server: HttpServer): Server {
           senderId: socket.data.userId,
           text: parsed.data.text,
           idempotencyKey: parsed.data.clientId,
+          replyToMessageId: parsed.data.replyToMessageId,
         });
         const serialized = await serializeMessageForDelivery(message);
         await publishMessage(serialized);
@@ -228,6 +229,18 @@ export async function publishMessage(message: ReturnType<typeof serializeMessage
     return;
   }
   socketServer.to(`conversation:${message.conversationId}`).emit("message:new", message);
+}
+
+export async function publishMessageUpdate(message: ReturnType<typeof serializeMessage>): Promise<void> {
+  if (!socketServer) throw new Error("Socket server has not been initialized");
+  const conversation = await Conversation.findOne({
+    _id: message.conversationId,
+    archivedAt: null,
+  }).select("participants").lean();
+  if (!conversation) return;
+  for (const userId of conversation.participants) {
+    socketServer.to(`user:${userId.toString()}`).emit("message:updated", message);
+  }
 }
 
 export async function publishGroupUpdate(groupId: string): Promise<void> {

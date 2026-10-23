@@ -46,6 +46,20 @@ export interface Message {
   type: "text" | "image";
   text: string;
   createdAt: string;
+  revision?: number;
+  editedAt?: string;
+  deletedAt?: string;
+  pinnedAt?: string;
+  reply?: {
+    id: string;
+    senderName: string;
+    text: string;
+    type: "text" | "image";
+  };
+  forwardedFrom?: {
+    senderName: string;
+    createdAt: string;
+  };
   sender?: { displayName: string; avatarUrl: string | null };
   image?: {
     contentType: "image/jpeg" | "image/png" | "image/webp";

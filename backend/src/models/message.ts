@@ -12,6 +12,16 @@ const imageSchema = new Schema(
   { _id: false },
 );
 
+const forwardedFromSchema = new Schema(
+  {
+    originalConversationId: { type: Schema.Types.ObjectId, required: true },
+    originalMessageId: { type: Schema.Types.ObjectId, required: true },
+    senderName: { type: String, required: true, maxlength: 80 },
+    createdAt: { type: Date, required: true },
+  },
+  { _id: false },
+);
+
 const messageSchema = new Schema(
   {
     conversationId: {
@@ -32,6 +42,12 @@ const messageSchema = new Schema(
     },
     image: { type: imageSchema, default: undefined, immutable: true },
     idempotencyKey: { type: String, required: true, immutable: true },
+    replyToMessageId: { type: Schema.Types.ObjectId, ref: "Message", immutable: true },
+    forwardedFrom: { type: forwardedFromSchema, immutable: true },
+    pinnedAt: { type: Date, default: undefined },
+    pinnedBy: { type: Schema.Types.ObjectId, ref: "User", default: undefined },
+    editedAt: { type: Date, default: undefined },
+    deletedAt: { type: Date, default: undefined },
   },
   { timestamps: { createdAt: true, updatedAt: false } },
 );

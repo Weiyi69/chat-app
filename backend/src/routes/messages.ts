@@ -5,22 +5,29 @@ import multer from "multer";
 import { env } from "../config/env.js";
 import { requireAuthentication } from "../middleware/authenticate.js";
 import { Message } from "../models/message.js";
-import { publishMessage } from "../sockets/realtime.js";
+import { publishMessage, publishMessageUpdate } from "../sockets/realtime.js";
 import { findConversationForMember, listReadPositions } from "../services/conversations.js";
-import { createPersistedImageMessage } from "../services/image-messages.js";
+import { createPersistedImageMessage, forwardPersistedMessage } from "../services/image-messages.js";
 import { processUploadedImage } from "../services/image-processing.js";
 import { imageStorage } from "../services/image-storage.js";
 import {
   ChatRequestError,
   createPersistedMessage,
+  deleteOwnMessage,
+  editOwnMessage,
   getMessageReaders,
   getMessagePage,
+  setMessagePinned,
   serializeMessageForDelivery,
 } from "../services/messages.js";
 import { objectIdSchema } from "../validators/common.js";
 import {
+  editMessageSchema,
+  deleteMessageSchema,
+  forwardMessageSchema,
   imageMessageUploadSchema,
   messagePageQuerySchema,
+  pinMessageSchema,
   sendMessageSchema,
 } from "../validators/messages.js";
 
@@ -40,13 +47,24 @@ const imageSendLimiter = rateLimit({
   legacyHeaders: false,
 });
 
+const forwardLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 20,
+  keyGenerator: (request) => request.session.userId!,
+  standardHeaders: "draft-8",
+  legacyHeaders: false,
+  message: {
+    error: { code: "RATE_LIMITED", message: "Too many forwards. Please try again in a minute." },
+  },
+});
+
 const imageUpload = multer({
   storage: multer.memoryStorage(),
   limits: {
     fileSize: env.IMAGE_MAX_UPLOAD_BYTES,
     files: 1,
-    fields: 2,
-    parts: 3,
+    fields: 3,
+    parts: 4,
   },
 });
 
@@ -66,7 +84,7 @@ messagesRouter.get("/:conversationId/messages", async (request, response) => {
     before: query.before,
     limit: query.limit,
   });
-  response.status(200).json(page);
+  response.set("Cache-Control", "private, no-store").status(200).json(page);
 });
 
 messagesRouter.get("/:conversationId/receipts", async (request, response) => {
@@ -75,7 +93,7 @@ messagesRouter.get("/:conversationId/receipts", async (request, response) => {
   if (!positions) {
     throw new ChatRequestError(404, "CONVERSATION_NOT_FOUND", "Conversation not found");
   }
-  response.status(200).json({ positions });
+  response.set("Cache-Control", "private, no-store").status(200).json({ positions });
 });
 
 messagesRouter.get(
@@ -88,7 +106,73 @@ messagesRouter.get(
       messageId,
       userId: request.session.userId!,
     });
-    response.status(200).json({ readers });
+    response.set("Cache-Control", "private, no-store").status(200).json({ readers });
+  },
+);
+
+messagesRouter.patch("/:conversationId/messages/:messageId", async (request, response) => {
+  const conversationId = objectIdSchema.parse(request.params.conversationId);
+  const messageId = objectIdSchema.parse(request.params.messageId);
+  const { text, revision } = editMessageSchema.parse(request.body);
+  const message = await editOwnMessage({
+    conversationId,
+    messageId,
+    userId: request.session.userId!,
+    text,
+    revision,
+  });
+  const serialized = await serializeMessageForDelivery(message);
+  await publishMessageUpdate(serialized);
+  response.set("Cache-Control", "private, no-store").status(200).json({ message: serialized });
+});
+
+messagesRouter.delete("/:conversationId/messages/:messageId", async (request, response) => {
+  const conversationId = objectIdSchema.parse(request.params.conversationId);
+  const messageId = objectIdSchema.parse(request.params.messageId);
+  const { revision } = deleteMessageSchema.parse(request.body);
+  const result = await deleteOwnMessage({
+    conversationId,
+    messageId,
+    userId: request.session.userId!,
+    revision,
+  });
+  const serialized = await serializeMessageForDelivery(result.message);
+  if (result.changed) await publishMessageUpdate(serialized);
+  response.set("Cache-Control", "private, no-store").status(200).json({ message: serialized });
+});
+
+messagesRouter.put("/:conversationId/messages/:messageId/pin", async (request, response) => {
+  const conversationId = objectIdSchema.parse(request.params.conversationId);
+  const messageId = objectIdSchema.parse(request.params.messageId);
+  const { pinned } = pinMessageSchema.parse(request.body);
+  const message = await setMessagePinned({
+    conversationId,
+    messageId,
+    userId: request.session.userId!,
+    pinned,
+  });
+  const serialized = await serializeMessageForDelivery(message.message);
+  if (message.changed) await publishMessageUpdate(serialized);
+  response.set("Cache-Control", "private, no-store").status(200).json({ message: serialized });
+});
+
+messagesRouter.post(
+  "/:conversationId/messages/:messageId/forward",
+  forwardLimiter,
+  async (request, response) => {
+    const conversationId = objectIdSchema.parse(request.params.conversationId);
+    const messageId = objectIdSchema.parse(request.params.messageId);
+    const input = forwardMessageSchema.parse(request.body);
+    const message = await forwardPersistedMessage({
+      sourceConversationId: conversationId,
+      messageId,
+      destinationConversationId: input.destinationConversationId,
+      userId: request.session.userId!,
+      idempotencyKey: input.clientId,
+    });
+    const serialized = await serializeMessageForDelivery(message);
+    await publishMessage(serialized);
+    response.set("Cache-Control", "private, no-store").status(201).json({ message: serialized });
   },
 );
 
@@ -100,6 +184,7 @@ messagesRouter.post("/:conversationId/messages", sendLimiter, async (request, re
     senderId: request.session.userId!,
     text: input.text,
     idempotencyKey: input.clientId,
+    replyToMessageId: input.replyToMessageId,
   });
   const serialized = await serializeMessageForDelivery(message);
 
@@ -136,6 +221,7 @@ messagesRouter.post(
       caption: parsed.data.caption,
       idempotencyKey: parsed.data.clientId,
       image: processed,
+      replyToMessageId: parsed.data.replyToMessageId,
     });
     const serialized = await serializeMessageForDelivery(message);
     await publishMessage(serialized);
@@ -157,6 +243,7 @@ messagesRouter.get(
       _id: messageId,
       conversationId,
       type: "image",
+      deletedAt: { $exists: false },
     }).lean();
     if (!message?.image) {
       throw new ChatRequestError(404, "IMAGE_NOT_FOUND", "Image not found");
@@ -168,14 +255,7 @@ messagesRouter.get(
       "Referrer-Policy": "no-referrer",
       "X-Content-Type-Options": "nosniff",
     });
-    if (imageStorage.driver === "s3") {
-      response.status(200).json({
-        url: await imageStorage.signedReadUrl(message.image.storageKey),
-      });
-      return;
-    }
-
-    const image = await imageStorage.readLocal(message.image.storageKey);
+    const image = await imageStorage.read(message.image.storageKey);
     response.status(200).type(message.image.contentType).send(image);
   },
 );

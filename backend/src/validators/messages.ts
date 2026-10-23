@@ -36,11 +36,13 @@ export const messagePageQuerySchema = z.object({
 export const sendMessageSchema = z.object({
   text: z.string().trim().min(1).max(4000),
   clientId: z.uuid(),
+  replyToMessageId: objectIdSchema.optional(),
 }).strict();
 
 export const imageMessageUploadSchema = z.object({
   caption: z.string().trim().max(4000).default(""),
   clientId: z.uuid(),
+  replyToMessageId: objectIdSchema.optional(),
 }).strict();
 
 export const socketMessageSchema = sendMessageSchema.extend({
@@ -54,6 +56,26 @@ export const socketJoinSchema = z.object({
 export const socketReadSchema = z.object({
   conversationId: objectIdSchema,
   messageId: objectIdSchema,
+}).strict();
+
+export const messageRevisionSchema = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER);
+
+export const editMessageSchema = z.object({
+  text: z.string().trim().min(1).max(4000),
+  revision: messageRevisionSchema,
+}).strict();
+
+export const deleteMessageSchema = z.object({
+  revision: messageRevisionSchema,
+}).strict();
+
+export const pinMessageSchema = z.object({
+  pinned: z.boolean(),
+}).strict();
+
+export const forwardMessageSchema = z.object({
+  destinationConversationId: objectIdSchema,
+  clientId: z.uuid(),
 }).strict();
 
 export function encodeMessageCursor(cursor: { createdAt: Date; id: string }): string {

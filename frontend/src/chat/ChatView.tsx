@@ -1,12 +1,13 @@
 import { useQuery, useQueryClient, type UseQueryResult } from "@tanstack/react-query";
-import { useEffect, useRef, useState, type ChangeEvent, type KeyboardEvent } from "react";
+import { useEffect, useRef, useState, type ChangeEvent, type KeyboardEvent, type RefObject } from "react";
 
 import { chatApi } from "../lib/api";
-import type { Conversation, GroupConversation, MessagePage, ReadPosition } from "../types";
+import type { Conversation, GroupConversation, Message, MessagePage, ReadPosition } from "../types";
 import { Avatar, formatDate, formatTime, mergeMessages } from "./chat-utils";
 
 export function ChatView({
   conversation,
+  conversations,
   currentUserId,
   messagesQuery,
   socketConnected,
@@ -16,23 +17,33 @@ export function ChatView({
   onSend,
   onSendImage,
   onMarkRead,
+  onEditMessage,
+  onDeleteMessage,
+  onPinMessage,
+  onForwardMessage,
 }: {
   conversation: Conversation;
+  conversations: Conversation[];
   currentUserId: string;
   messagesQuery: UseQueryResult<MessagePage, Error>;
   socketConnected: boolean;
   conversationJoined: boolean;
   socketError: string;
   onBack: () => void;
-  onSend: (text: string, clientId: string) => Promise<void>;
+  onSend: (text: string, clientId: string, replyToMessageId?: string) => Promise<void>;
   onSendImage: (
     file: File,
     caption: string,
     clientId: string,
     onProgress: (progress: number) => void,
     signal: AbortSignal,
+    replyToMessageId?: string,
   ) => Promise<void>;
   onMarkRead: (messageId: string) => Promise<void>;
+  onEditMessage: (messageId: string, text: string, revision: number) => Promise<unknown>;
+  onDeleteMessage: (messageId: string, revision: number) => Promise<unknown>;
+  onPinMessage: (messageId: string, pinned: boolean) => Promise<void>;
+  onForwardMessage: (messageId: string, destinationConversationId: string, clientId: string) => Promise<void>;
 }) {
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
@@ -55,12 +66,31 @@ export function ChatView({
   const [groupPhotoSuccess, setGroupPhotoSuccess] = useState("");
   const [selectedReceiptMessageId, setSelectedReceiptMessageId] = useState<string | null>(null);
   const [receiptError, setReceiptError] = useState("");
+  const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
+  const [editDraft, setEditDraft] = useState("");
+  const [confirmDeleteMessageId, setConfirmDeleteMessageId] = useState<string | null>(null);
+  const [messageActionBusy, setMessageActionBusy] = useState<string | null>(null);
+  const [messageActionError, setMessageActionError] = useState("");
+  const [messageActionErrorId, setMessageActionErrorId] = useState<string | null>(null);
+  const [openMenuMessageId, setOpenMenuMessageId] = useState<string | null>(null);
+  const [replyToMessageId, setReplyToMessageId] = useState<string | null>(null);
+  const [replyNavigationError, setReplyNavigationError] = useState("");
+  const [highlightedMessageId, setHighlightedMessageId] = useState<string | null>(null);
+  const [forwardMessageId, setForwardMessageId] = useState<string | null>(null);
+  const [forwardDestinationId, setForwardDestinationId] = useState("");
+  const [forwardClientId, setForwardClientId] = useState("");
+  const [forwardBusy, setForwardBusy] = useState(false);
+  const [forwardError, setForwardError] = useState("");
   const idempotencyKey = useRef<string | null>(null);
   const imageIdempotencyKey = useRef<string | null>(null);
   const previewUrlRef = useRef<string | null>(null);
   const uploadController = useRef<AbortController | null>(null);
   const viewerCloseRef = useRef<HTMLButtonElement>(null);
   const viewerTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const moreMenuRef = useRef<HTMLDivElement>(null);
+  const moreTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const forwardDialogRef = useRef<HTMLElement>(null);
+  const composerRef = useRef<HTMLTextAreaElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const lastReadAttemptRef = useRef<string | null>(null);
   const pendingReadRef = useRef<string | null>(null);
@@ -93,6 +123,9 @@ export function ChatView({
   const groupPhotoUrl = groupDetails ? groupDetails.photoUrl : isGroup ? conversation.photoUrl : null;
   const page = messagesQuery.data;
   const messages = page?.messages ?? [];
+  const replyTarget = messages.find((message) => message.id === replyToMessageId);
+  const forwardTarget = messages.find((message) => message.id === forwardMessageId);
+  const forwardDestinations = conversations.filter((item) => item.id !== conversation.id);
   const receiptsQuery = useQuery({
     queryKey: ["receipts", conversation.id],
     queryFn: () => chatApi.receipts(conversation.id),
@@ -110,6 +143,60 @@ export function ChatView({
     setSelectedReceiptMessageId(null);
     setReceiptError("");
   }, [conversation.id]);
+
+  useEffect(() => {
+    setOpenMenuMessageId(null);
+    setReplyToMessageId(null);
+    setForwardMessageId(null);
+    setForwardError("");
+  }, [conversation.id]);
+
+  useEffect(() => {
+    if (!openMenuMessageId) return;
+    const closeMenuOnEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setOpenMenuMessageId(null);
+        moreTriggerRef.current?.focus();
+      }
+    };
+    const closeMenuOutside = (event: PointerEvent) => {
+      const target = event.target;
+      if (
+        target instanceof Node &&
+        !moreMenuRef.current?.contains(target) &&
+        !moreTriggerRef.current?.contains(target)
+      ) {
+        setOpenMenuMessageId(null);
+      }
+    };
+    window.addEventListener("keydown", closeMenuOnEscape);
+    document.addEventListener("pointerdown", closeMenuOutside);
+    return () => {
+      window.removeEventListener("keydown", closeMenuOnEscape);
+      document.removeEventListener("pointerdown", closeMenuOutside);
+    };
+  }, [openMenuMessageId]);
+
+  useEffect(() => {
+    if (!forwardMessageId) return;
+    requestAnimationFrame(() => {
+      const firstControl = forwardDialogRef.current?.querySelector<HTMLElement>(
+        "select, button:not(:disabled)",
+      );
+      (firstControl ?? forwardDialogRef.current)?.focus();
+    });
+  }, [forwardMessageId]);
+
+  useEffect(() => {
+    if (
+      viewerPath &&
+      !messagesQuery.isLoading &&
+      !messages.some((message) => message.image?.url === viewerPath)
+    ) {
+      setViewerPath(null);
+    }
+  }, [messages, messagesQuery.isLoading, viewerPath]);
 
   useEffect(() => {
     const container = scrollRef.current;
@@ -217,14 +304,17 @@ export function ChatView({
           imageIdempotencyKey.current,
           setUploadProgress,
           controller.signal,
+          replyToMessageId ?? undefined,
         );
         clearSelectedImage();
       } else {
         idempotencyKey.current ??= window.crypto.randomUUID();
-        await onSend(text, idempotencyKey.current);
+        await onSend(text, idempotencyKey.current, replyToMessageId ?? undefined);
         idempotencyKey.current = null;
       }
       setDraft("");
+      setReplyToMessageId(null);
+      setReplyNavigationError("");
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") {
         setSendError("Upload cancelled. You can retry sending the image.");
@@ -390,6 +480,184 @@ export function ChatView({
     });
   }
 
+  async function saveMessageEdit(messageId: string) {
+    const text = editDraft.trim();
+    if (!text || text.length > 4000 || messageActionBusy) return;
+    setMessageActionBusy(messageId);
+    setMessageActionError("");
+    try {
+      const message = messages.find((item) => item.id === messageId);
+      await onEditMessage(messageId, text, message?.revision ?? 0);
+      setEditingMessageId(null);
+      setEditDraft("");
+    } catch (error) {
+      setMessageActionError(error instanceof Error ? error.message : "Message could not be edited.");
+      setMessageActionErrorId(messageId);
+    } finally {
+      setMessageActionBusy(null);
+    }
+  }
+
+  async function confirmDeleteMessage(messageId: string) {
+    if (messageActionBusy) return;
+    setMessageActionBusy(messageId);
+    setMessageActionError("");
+    try {
+      const message = messages.find((item) => item.id === messageId);
+      await onDeleteMessage(messageId, message?.revision ?? 0);
+      setConfirmDeleteMessageId(null);
+      setEditingMessageId(null);
+    } catch (error) {
+      setMessageActionError(error instanceof Error ? error.message : "Message could not be deleted.");
+      setMessageActionErrorId(messageId);
+    } finally {
+      setMessageActionBusy(null);
+    }
+  }
+
+  function getMessageSenderName(message: Message) {
+    if (message.sender?.displayName) return message.sender.displayName;
+    const member = isGroup
+      ? groupDetails?.members.find((item) => item.userId === message.senderId)
+      : undefined;
+    return member?.displayName ?? (message.senderId === currentUserId ? "You" : "Conversation member");
+  }
+
+  function getReplyExcerpt(message: Message) {
+    if (message.deletedAt) return "This message was deleted";
+    if (message.type === "image") return message.text ? `Photo: ${message.text}` : "Photo";
+    return message.text;
+  }
+
+  function startReply(message: Message) {
+    idempotencyKey.current = null;
+    imageIdempotencyKey.current = null;
+    setImageRetryAvailable(false);
+    setReplyToMessageId(message.id);
+    setReplyNavigationError("");
+    setOpenMenuMessageId(null);
+    requestAnimationFrame(() => composerRef.current?.focus());
+  }
+
+  function toggleMessageMenu(messageId: string, trigger: HTMLButtonElement) {
+    moreTriggerRef.current = trigger;
+    if (openMenuMessageId === messageId) {
+      setOpenMenuMessageId(null);
+      return;
+    }
+    setOpenMenuMessageId(messageId);
+    requestAnimationFrame(() =>
+      moreMenuRef.current?.querySelector<HTMLButtonElement>('[role="menuitem"]')?.focus(),
+    );
+  }
+
+  async function navigateToOriginal(messageId: string) {
+    setReplyNavigationError("");
+    let found = messages.some((message) => message.id === messageId);
+    let cursor = page?.nextCursor ?? null;
+    try {
+      while (!found && cursor) {
+        const older = await chatApi.messages(conversation.id, cursor);
+        queryClient.setQueryData<MessagePage>(["messages", conversation.id], (current) => ({
+          messages: mergeMessages(older.messages, current?.messages ?? []),
+          nextCursor: older.nextCursor,
+        }));
+        found = older.messages.some((message) => message.id === messageId);
+        cursor = older.nextCursor;
+        pinnedToBottom.current = false;
+      }
+      if (!found) {
+        setReplyNavigationError("The original message is no longer available.");
+        return;
+      }
+      requestAnimationFrame(() => {
+        const target = document.getElementById(`message-${messageId}`);
+        target?.scrollIntoView?.({ behavior: "smooth", block: "center" });
+        setHighlightedMessageId(messageId);
+        window.setTimeout(() => setHighlightedMessageId(null), 1800);
+      });
+    } catch {
+      setReplyNavigationError("The original message could not be opened.");
+    }
+  }
+
+  async function togglePin(message: Message) {
+    if (messageActionBusy) return;
+    setMessageActionBusy(message.id);
+    setMessageActionError("");
+    setMessageActionErrorId(null);
+    setOpenMenuMessageId(null);
+    try {
+      await onPinMessage(message.id, !message.pinnedAt);
+    } catch (error) {
+      setMessageActionError(error instanceof Error ? error.message : "Pin status could not be updated.");
+      setMessageActionErrorId(message.id);
+    } finally {
+      setMessageActionBusy(null);
+    }
+  }
+
+  async function forwardSelectedMessage() {
+    if (!forwardMessageId || !forwardDestinationId || forwardBusy || !forwardClientId) return;
+    setForwardBusy(true);
+    setForwardError("");
+    try {
+      await onForwardMessage(forwardMessageId, forwardDestinationId, forwardClientId);
+      setForwardMessageId(null);
+      setForwardDestinationId("");
+      setForwardClientId("");
+    } catch (error) {
+      setForwardError(error instanceof Error ? error.message : "Message could not be forwarded.");
+    } finally {
+      setForwardBusy(false);
+    }
+  }
+
+  function handleMenuKeyDown(event: KeyboardEvent<HTMLDivElement>) {
+    if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    const items = Array.from(
+      event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="menuitem"]:not(:disabled)'),
+    );
+    if (!items.length) return;
+    const currentIndex = items.indexOf(document.activeElement as HTMLButtonElement);
+    const nextIndex = event.key === "Home"
+      ? 0
+      : event.key === "End"
+        ? items.length - 1
+        : (currentIndex + (event.key === "ArrowDown" ? 1 : -1) + items.length) % items.length;
+    items[nextIndex]?.focus();
+  }
+
+  function handleForwardDialogKeyDown(event: KeyboardEvent<HTMLElement>) {
+    if (event.key === "Escape" && !forwardBusy) {
+      event.preventDefault();
+      setForwardMessageId(null);
+      requestAnimationFrame(() => moreTriggerRef.current?.focus());
+      return;
+    }
+    if (event.key !== "Tab") return;
+    const controls = Array.from(
+      event.currentTarget.querySelectorAll<HTMLElement>(
+        "select:not(:disabled), button:not(:disabled)",
+      ),
+    );
+    if (!controls.length) {
+      event.preventDefault();
+      event.currentTarget.focus();
+      return;
+    }
+    const first = controls[0];
+    const last = controls.at(-1);
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last?.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first?.focus();
+    }
+  }
+
   const recipientPosition = receiptsQuery.data?.find((position) => position.userId !== currentUserId);
   const isAtOrBeforePosition = (message: { id: string; createdAt: string }, position: ReadPosition) => {
     const messageTime = new Date(message.createdAt).getTime();
@@ -399,11 +667,13 @@ export function ChatView({
   };
   const latestReadOwnMessage = !isGroup && recipientPosition
     ? [...messages].reverse().find((message) =>
-        message.senderId === currentUserId && isAtOrBeforePosition(message, recipientPosition),
+        message.senderId === currentUserId &&
+        !message.deletedAt &&
+        isAtOrBeforePosition(message, recipientPosition),
       )
     : undefined;
   const latestSentOwnMessage = [...messages].reverse().find(
-    (message) => message.senderId === currentUserId,
+    (message) => message.senderId === currentUserId && !message.deletedAt,
   );
 
   return (
@@ -698,6 +968,7 @@ export function ChatView({
         )}
         {messages.map((message, index) => {
           const own = message.senderId === currentUserId;
+          const deleted = Boolean(message.deletedAt);
           const image = message.image;
           const groupMember = groupDetails?.members.find((member) => member.userId === message.senderId);
           const senderName = message.sender?.displayName ?? groupMember?.displayName ??
@@ -711,13 +982,111 @@ export function ChatView({
           return (
             <div key={message.id}>
               {showDate && <div className="date-divider">{formatDate(message.createdAt)}</div>}
-              <div className={`message-row ${own ? "own" : ""}`}>
+              <div
+                id={`message-${message.id}`}
+                className={`message-row ${own ? "own" : ""} ${highlightedMessageId === message.id ? "highlighted" : ""}`}
+              >
                 {!own && (
                   <Avatar name={senderName} avatarUrl={senderAvatar} />
                 )}
+                {own && (
+                  <MessageActionToolbar
+                    message={message}
+                    own={own}
+                    deleted={deleted}
+                    menuOpen={openMenuMessageId === message.id}
+                    busy={messageActionBusy !== null}
+                    menuRef={moreMenuRef}
+                    onReply={() => startReply(message)}
+                    onToggleMenu={(button) => toggleMessageMenu(message.id, button)}
+                    onEdit={() => {
+                      setOpenMenuMessageId(null);
+                      setEditingMessageId(message.id);
+                      setEditDraft(message.text);
+                      setConfirmDeleteMessageId(null);
+                      setMessageActionError("");
+                    }}
+                    onUnsend={() => {
+                      setOpenMenuMessageId(null);
+                      setConfirmDeleteMessageId(message.id);
+                      setMessageActionError("");
+                    }}
+                    onPin={() => void togglePin(message)}
+                    onForward={() => {
+                      setOpenMenuMessageId(null);
+                      setForwardMessageId(message.id);
+                      setForwardDestinationId(forwardDestinations[0]?.id ?? "");
+                      setForwardClientId(window.crypto.randomUUID());
+                      setForwardError("");
+                    }}
+                    onMenuKeyDown={handleMenuKeyDown}
+                    hasDestinations={forwardDestinations.length > 0}
+                  />
+                )}
                 <div className={`message-content ${own ? "own" : ""}`}>
                   {isGroup && <span className="group-message-sender">{senderName}</span>}
-                  {message.type === "image" && image ? (
+                  {message.forwardedFrom && !deleted && (
+                    <span className="forwarded-attribution">
+                      Forwarded from {message.forwardedFrom.senderName}
+                    </span>
+                  )}
+                  {message.reply && (
+                    <button
+                      type="button"
+                      className="message-reply-preview"
+                      onClick={() => void navigateToOriginal(message.reply!.id)}
+                      aria-label={`Go to reply target from ${message.reply.senderName}: ${message.reply.text || (message.reply.type === "image" ? "Photo" : "Message")}`}
+                    >
+                      <span>{message.reply.senderName}</span>
+                      <span>{message.reply.text || (message.reply.type === "image" ? "Photo" : "Message")}</span>
+                    </button>
+                  )}
+                  {editingMessageId === message.id ? (
+                    <form
+                      className="message-edit-form"
+                      onSubmit={(event) => {
+                        event.preventDefault();
+                        void saveMessageEdit(message.id);
+                      }}
+                    >
+                      <label className="sr-only" htmlFor={`edit-message-${message.id}`}>
+                        Edit message
+                      </label>
+                      <textarea
+                        id={`edit-message-${message.id}`}
+                        value={editDraft}
+                        maxLength={4000}
+                        autoFocus
+                        disabled={messageActionBusy === message.id}
+                        onChange={(event) => setEditDraft(event.target.value)}
+                      />
+                      <div className="message-action-buttons">
+                        <button
+                          type="submit"
+                          className="quiet-button"
+                          disabled={messageActionBusy === message.id || !editDraft.trim()}
+                        >
+                          {messageActionBusy === message.id ? "Saving..." : "Save"}
+                        </button>
+                        <button
+                          type="button"
+                          className="quiet-button"
+                          disabled={messageActionBusy === message.id}
+                          onClick={() => {
+                            setEditingMessageId(null);
+                            setEditDraft("");
+                            setMessageActionError("");
+                          }}
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    </form>
+                  ) : deleted ? (
+                    <div className={`message-bubble deleted-message ${own ? "own" : ""}`}>
+                      This message was deleted.
+                    </div>
+                  ) : message.type === "image" && image ? (
                     <div className={`message-bubble image-message-bubble ${own ? "own" : ""}`}>
                       <MessageImage
                         path={image.url}
@@ -733,14 +1102,42 @@ export function ChatView({
                     <div className={`message-bubble ${own ? "own" : ""}`}>{message.text}</div>
                   )}
                   <time>{formatTime(message.createdAt)}</time>
-                  {own && !isGroup && latestReadOwnMessage?.id === message.id && (
+                  {!deleted && message.editedAt && <span className="message-edited">Edited</span>}
+                  {!deleted && message.pinnedAt && (
+                    <span className="message-pinned-label" aria-label="Pinned message">Pinned</span>
+                  )}
+                  {confirmDeleteMessageId === message.id && (
+                    <div className="message-delete-confirm" role="group" aria-label="Confirm message unsend">
+                      <span>Unsend this message?</span>
+                      <button
+                        type="button"
+                        className="message-action-button"
+                        disabled={messageActionBusy === message.id}
+                        onClick={() => void confirmDeleteMessage(message.id)}
+                      >
+                        {messageActionBusy === message.id ? "Unsending..." : "Confirm"}
+                      </button>
+                      <button
+                        type="button"
+                        className="message-action-button"
+                        disabled={messageActionBusy === message.id}
+                        onClick={() => setConfirmDeleteMessageId(null)}
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  )}
+                  {messageActionError && messageActionErrorId === message.id && (
+                    <span className="message-action-error" role="alert">{messageActionError}</span>
+                  )}
+                  {own && !deleted && !isGroup && latestReadOwnMessage?.id === message.id && (
                     <span className="message-receipt" aria-label="Read by recipient">Seen</span>
                   )}
-                  {own && latestSentOwnMessage?.id === message.id &&
+                  {own && !deleted && latestSentOwnMessage?.id === message.id &&
                     (isGroup || latestReadOwnMessage?.id !== message.id) && (
                     <span className="message-receipt" aria-label="Message saved">Sent</span>
                   )}
-                  {own && isGroup && (
+                  {own && !deleted && isGroup && (
                     <div className="message-reader-details">
                       <button
                         type="button"
@@ -769,6 +1166,30 @@ export function ChatView({
                     </div>
                   )}
                 </div>
+                {!own && (
+                  <MessageActionToolbar
+                    message={message}
+                    own={own}
+                    deleted={deleted}
+                    menuOpen={openMenuMessageId === message.id}
+                    busy={messageActionBusy !== null}
+                    menuRef={moreMenuRef}
+                    onReply={() => startReply(message)}
+                    onToggleMenu={(button) => toggleMessageMenu(message.id, button)}
+                    onEdit={() => undefined}
+                    onUnsend={() => undefined}
+                    onPin={() => void togglePin(message)}
+                    onForward={() => {
+                      setOpenMenuMessageId(null);
+                      setForwardMessageId(message.id);
+                      setForwardDestinationId(forwardDestinations[0]?.id ?? "");
+                      setForwardClientId(window.crypto.randomUUID());
+                      setForwardError("");
+                    }}
+                    onMenuKeyDown={handleMenuKeyDown}
+                    hasDestinations={forwardDestinations.length > 0}
+                  />
+                )}
                 {isGroup && own && <Avatar name={senderName} avatarUrl={senderAvatar} />}
               </div>
             </div>
@@ -789,7 +1210,30 @@ export function ChatView({
           void sendDraft();
         }}
       >
+        {replyNavigationError && <p className="reply-navigation-error" role="status">{replyNavigationError}</p>}
         {sendError && <p className="send-error" role="alert">{sendError}</p>}
+        {replyToMessageId && replyTarget && (
+          <div className="reply-composer-preview">
+            <div>
+              <span className="reply-composer-label">Replying to {getMessageSenderName(replyTarget)}</span>
+              <span className="reply-composer-excerpt">{getReplyExcerpt(replyTarget)}</span>
+            </div>
+            <button
+              type="button"
+              className="reply-cancel-button"
+              aria-label="Cancel reply"
+              onClick={() => {
+                setReplyToMessageId(null);
+                idempotencyKey.current = null;
+                imageIdempotencyKey.current = null;
+                setImageRetryAvailable(false);
+              }}
+              disabled={sending}
+            >
+              ×
+            </button>
+          </div>
+        )}
         {selectedImage && previewUrl && (
           <div className="image-preview">
             <img src={previewUrl} alt="Selected image preview" />
@@ -829,6 +1273,7 @@ export function ChatView({
             />
           </label>
           <textarea
+            ref={composerRef}
             aria-label="Write a message"
             value={draft}
             onChange={(event) => {
@@ -865,6 +1310,68 @@ export function ChatView({
         </div>
         <span className="composer-hint">Enter to send · Shift + Enter for a new line</span>
       </form>
+      {forwardMessageId && forwardTarget && (
+        <div
+          className="forward-dialog-backdrop"
+          role="presentation"
+          onClick={(event) => {
+            if (event.target === event.currentTarget && !forwardBusy) setForwardMessageId(null);
+          }}
+        >
+          <section
+            ref={forwardDialogRef}
+            className="forward-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="forward-message-title"
+            tabIndex={-1}
+            onKeyDown={handleForwardDialogKeyDown}
+          >
+            <h2 id="forward-message-title">Forward message</h2>
+            <p className="forward-dialog-preview">
+              {forwardTarget.deletedAt ? "This message was deleted." : getReplyExcerpt(forwardTarget)}
+            </p>
+            {forwardDestinations.length ? (
+              <>
+                <label htmlFor="forward-destination">Choose a conversation</label>
+                <select
+                  id="forward-destination"
+                  value={forwardDestinationId}
+                  onChange={(event) => setForwardDestinationId(event.target.value)}
+                  disabled={forwardBusy}
+                >
+                  {forwardDestinations.map((destination) => (
+                    <option key={destination.id} value={destination.id}>
+                      {destination.kind === "group" ? destination.name : destination.otherUser.displayName}
+                    </option>
+                  ))}
+                </select>
+                {forwardError && <p className="message-action-error" role="alert">{forwardError}</p>}
+                <div className="forward-dialog-actions">
+                  <button
+                    type="button"
+                    className="quiet-button"
+                    disabled={forwardBusy}
+                    onClick={() => setForwardMessageId(null)}
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    className="send-button"
+                    disabled={forwardBusy || !forwardDestinationId}
+                    onClick={() => void forwardSelectedMessage()}
+                  >
+                    {forwardBusy ? "Forwarding..." : "Forward"}
+                  </button>
+                </div>
+              </>
+            ) : (
+              <p className="muted-note">There are no other conversations to forward to.</p>
+            )}
+          </section>
+        </div>
+      )}
       {viewerPath && (
         <div
           className="image-viewer-backdrop"
@@ -885,6 +1392,105 @@ export function ChatView({
             </button>
             <ImageViewer path={viewerPath} />
           </section>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function MessageActionToolbar({
+  message,
+  own,
+  deleted,
+  menuOpen,
+  busy,
+  menuRef,
+  onReply,
+  onToggleMenu,
+  onEdit,
+  onUnsend,
+  onPin,
+  onForward,
+  onMenuKeyDown,
+  hasDestinations,
+}: {
+  message: Message;
+  own: boolean;
+  deleted: boolean;
+  menuOpen: boolean;
+  busy: boolean;
+  menuRef: RefObject<HTMLDivElement | null>;
+  onReply: () => void;
+  onToggleMenu: (trigger: HTMLButtonElement) => void;
+  onEdit: () => void;
+  onUnsend: () => void;
+  onPin: () => void;
+  onForward: () => void;
+  onMenuKeyDown: (event: KeyboardEvent<HTMLDivElement>) => void;
+  hasDestinations: boolean;
+}) {
+  const canForward = message.type === "text" || Boolean(message.image?.url);
+  return (
+    <div className={`message-action-toolbar ${own ? "own" : "incoming"}`} aria-label="Message actions">
+      <button
+        type="button"
+        className="message-icon-action"
+        aria-label={`Reply to ${own ? "your message" : message.sender?.displayName ?? "message"}`}
+        title="Reply"
+        onClick={onReply}
+      >
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M10 8V4L3 11l7 7v-4c5 0 8 1.5 11 5-1-6-4-11-11-11Z" />
+        </svg>
+      </button>
+      {!deleted && (
+        <div className="message-more-actions">
+          <button
+            type="button"
+            className="message-icon-action more-actions-trigger"
+            aria-label="More actions"
+            aria-haspopup="menu"
+            aria-expanded={menuOpen}
+            title="More actions"
+            onClick={(event) => onToggleMenu(event.currentTarget)}
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <circle cx="12" cy="5" r="1.7" />
+              <circle cx="12" cy="12" r="1.7" />
+              <circle cx="12" cy="19" r="1.7" />
+            </svg>
+          </button>
+          {menuOpen && (
+            <div
+              ref={menuRef}
+              className="message-action-menu"
+              role="menu"
+              aria-label="More actions for message"
+              onKeyDown={onMenuKeyDown}
+            >
+              {own && !deleted && message.type === "text" && (
+                <button type="button" role="menuitem" disabled={busy} onClick={onEdit}>Edit</button>
+              )}
+              {own && !deleted && (
+                <button type="button" role="menuitem" disabled={busy} onClick={onUnsend}>Unsend</button>
+              )}
+              {!deleted && (
+                <button type="button" role="menuitem" disabled={busy} onClick={onPin}>
+                  {message.pinnedAt ? "Unpin" : "Pin"}
+                </button>
+              )}
+              {!deleted && (
+                <button
+                  type="button"
+                  role="menuitem"
+                  disabled={busy || !hasDestinations || !canForward}
+                  onClick={onForward}
+                >
+                  Forward
+                </button>
+              )}
+            </div>
+          )}
         </div>
       )}
     </div>

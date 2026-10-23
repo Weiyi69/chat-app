@@ -1,8 +1,10 @@
 import { randomUUID } from "node:crypto";
 
 import { Message } from "../models/message.js";
+import { User } from "../models/user.js";
+import { findConversationForMember } from "./conversations.js";
 import { ChatRequestError, createPersistedMessage } from "./messages.js";
-import type { ProcessedImage } from "./image-processing.js";
+import { processUploadedImage, type ProcessedImage } from "./image-processing.js";
 import { imageStorage } from "./image-storage.js";
 
 export async function createPersistedImageMessage(input: {
@@ -11,6 +13,13 @@ export async function createPersistedImageMessage(input: {
   caption: string;
   idempotencyKey: string;
   image: ProcessedImage;
+  replyToMessageId?: string;
+  forwardedFrom?: {
+    originalConversationId: string;
+    originalMessageId: string;
+    senderName: string;
+    createdAt: Date;
+  };
 }) {
   const existing = await Message.findOne({
     conversationId: input.conversationId,
@@ -21,7 +30,12 @@ export async function createPersistedImageMessage(input: {
     if (
       existing.type !== "image" ||
       existing.text !== input.caption ||
-      existing.image?.sha256 !== input.image.sha256
+      existing.image?.sha256 !== input.image.sha256 ||
+      existing.replyToMessageId?.toString() !== input.replyToMessageId ||
+      (input.forwardedFrom
+        ? existing.forwardedFrom?.originalConversationId.toString() !== input.forwardedFrom.originalConversationId ||
+          existing.forwardedFrom?.originalMessageId.toString() !== input.forwardedFrom.originalMessageId
+        : Boolean(existing.forwardedFrom))
     ) {
       throw new ChatRequestError(409, "IDEMPOTENCY_CONFLICT", "Message retry does not match the original");
     }
@@ -45,6 +59,8 @@ export async function createPersistedImageMessage(input: {
         height: input.image.height,
         sha256: input.image.sha256,
       },
+      replyToMessageId: input.replyToMessageId,
+      forwardedFrom: input.forwardedFrom,
     });
 
     if (message.image?.storageKey !== storageKey) {
@@ -65,6 +81,113 @@ export async function createPersistedImageMessage(input: {
     }
     throw error;
   }
+}
+
+export async function forwardPersistedMessage(input: {
+  sourceConversationId: string;
+  messageId: string;
+  destinationConversationId: string;
+  userId: string;
+  idempotencyKey: string;
+}) {
+  if (input.sourceConversationId === input.destinationConversationId) {
+    throw new ChatRequestError(400, "INVALID_DESTINATION", "Choose a different conversation.");
+  }
+  const [sourceConversation, destinationConversation] = await Promise.all([
+    findConversationForMember(input.sourceConversationId, input.userId),
+    findConversationForMember(input.destinationConversationId, input.userId),
+  ]);
+  if (!sourceConversation || sourceConversation.archivedAt) {
+    throw new ChatRequestError(404, "MESSAGE_NOT_FOUND", "Message not found");
+  }
+  if (!destinationConversation || destinationConversation.archivedAt) {
+    throw new ChatRequestError(404, "CONVERSATION_NOT_FOUND", "Destination conversation not found");
+  }
+
+  const existingForward = await Message.findOne({
+    conversationId: destinationConversation._id,
+    senderId: input.userId,
+    idempotencyKey: input.idempotencyKey,
+  });
+  if (existingForward?.forwardedFrom?.originalConversationId.toString() === input.sourceConversationId &&
+      existingForward.forwardedFrom.originalMessageId.toString() === input.messageId) {
+    return existingForward;
+  }
+
+  const source = await Message.findOne({
+    _id: input.messageId,
+    conversationId: sourceConversation._id,
+    deletedAt: { $exists: false },
+  });
+  if (!source) {
+    throw new ChatRequestError(404, "MESSAGE_NOT_FOUND", "Message not found");
+  }
+  const originalSender = await User.findById(source.senderId).select("displayName").lean();
+  const forwardedFrom = {
+    originalConversationId: input.sourceConversationId,
+    originalMessageId: source._id.toString(),
+    senderName: source.forwardedFrom?.senderName ?? originalSender?.displayName ?? "Former member",
+    createdAt: source.forwardedFrom?.createdAt ?? source.createdAt,
+  };
+
+  if (source.type !== "image" || !source.image) {
+    const stillAuthorized = await Promise.all([
+      findConversationForMember(input.sourceConversationId, input.userId),
+      Message.findOne({
+        _id: source._id,
+        conversationId: sourceConversation._id,
+        deletedAt: { $exists: false },
+      }).select("_id").lean(),
+    ]);
+    if (!stillAuthorized[0] || stillAuthorized[0].archivedAt || !stillAuthorized[1]) {
+      throw new ChatRequestError(404, "MESSAGE_NOT_FOUND", "Message not found");
+    }
+    return createPersistedMessage({
+      conversationId: input.destinationConversationId,
+      senderId: input.userId,
+      text: source.text,
+      idempotencyKey: input.idempotencyKey,
+      forwardedFrom,
+    });
+  }
+
+  const sourceBytes = await imageStorage.read(source.image.storageKey);
+  const stillAuthorizedSource = await Promise.all([
+    findConversationForMember(input.sourceConversationId, input.userId),
+    Message.findOne({
+      _id: source._id,
+      conversationId: sourceConversation._id,
+      deletedAt: { $exists: false },
+    }).select("_id").lean(),
+  ]);
+  if (!stillAuthorizedSource[0] || stillAuthorizedSource[0].archivedAt || !stillAuthorizedSource[1]) {
+    throw new ChatRequestError(404, "MESSAGE_NOT_FOUND", "Message not found");
+  }
+
+  const copiedImage = await processUploadedImage(sourceBytes);
+  const stillAuthorizedAfterProcessing = await Promise.all([
+    findConversationForMember(input.sourceConversationId, input.userId),
+    Message.findOne({
+      _id: source._id,
+      conversationId: sourceConversation._id,
+      deletedAt: { $exists: false },
+    }).select("_id").lean(),
+  ]);
+  if (
+    !stillAuthorizedAfterProcessing[0] ||
+    stillAuthorizedAfterProcessing[0].archivedAt ||
+    !stillAuthorizedAfterProcessing[1]
+  ) {
+    throw new ChatRequestError(404, "MESSAGE_NOT_FOUND", "Message not found");
+  }
+  return createPersistedImageMessage({
+    conversationId: input.destinationConversationId,
+    senderId: input.userId,
+    caption: source.text,
+    idempotencyKey: input.idempotencyKey,
+    image: copiedImage,
+    forwardedFrom,
+  });
 }
 
 export async function cleanupOrphanedImages(): Promise<void> {

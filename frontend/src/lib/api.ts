@@ -76,6 +76,7 @@ function uploadImage(
   clientId: string,
   onProgress: (progress: number) => void,
   signal: AbortSignal,
+  replyToMessageId?: string,
 ): Promise<Message> {
   return ensureCsrfToken().then((token) =>
     new Promise<Message>((resolve, reject) => {
@@ -83,6 +84,7 @@ function uploadImage(
       const form = new FormData();
       form.append("caption", caption);
       form.append("clientId", clientId);
+      if (replyToMessageId) form.append("replyToMessageId", replyToMessageId);
       form.append("image", file);
       xhr.open(
         "POST",
@@ -345,10 +347,35 @@ export const chatApi = {
     (await apiRequest<{ readers: MessageReader[] }>(
       `/conversations/${encodeURIComponent(conversationId)}/messages/${encodeURIComponent(messageId)}/readers`,
     )).readers,
-  sendMessage: async (conversationId: string, text: string, clientId: string) =>
+  sendMessage: async (conversationId: string, text: string, clientId: string, replyToMessageId?: string) =>
     (await apiRequest<{ message: Message }>(
       `/conversations/${encodeURIComponent(conversationId)}/messages`,
-      { method: "POST", body: JSON.stringify({ text, clientId }) },
+      { method: "POST", body: JSON.stringify({ text, clientId, ...(replyToMessageId ? { replyToMessageId } : {}) }) },
+    )).message,
+  editMessage: async (conversationId: string, messageId: string, text: string, revision: number) =>
+    (await apiRequest<{ message: Message }>(
+      `/conversations/${encodeURIComponent(conversationId)}/messages/${encodeURIComponent(messageId)}`,
+      { method: "PATCH", body: JSON.stringify({ text, revision }) },
+    )).message,
+  deleteMessage: async (conversationId: string, messageId: string, revision: number) =>
+    (await apiRequest<{ message: Message }>(
+      `/conversations/${encodeURIComponent(conversationId)}/messages/${encodeURIComponent(messageId)}`,
+      { method: "DELETE", body: JSON.stringify({ revision }) },
+    )).message,
+  setMessagePinned: async (conversationId: string, messageId: string, pinned: boolean) =>
+    (await apiRequest<{ message: Message }>(
+      `/conversations/${encodeURIComponent(conversationId)}/messages/${encodeURIComponent(messageId)}/pin`,
+      { method: "PUT", body: JSON.stringify({ pinned }) },
+    )).message,
+  forwardMessage: async (
+    sourceConversationId: string,
+    messageId: string,
+    destinationConversationId: string,
+    clientId: string,
+  ) =>
+    (await apiRequest<{ message: Message }>(
+      `/conversations/${encodeURIComponent(sourceConversationId)}/messages/${encodeURIComponent(messageId)}/forward`,
+      { method: "POST", body: JSON.stringify({ destinationConversationId, clientId }) },
     )).message,
   sendImage: uploadImage,
   loadPrivateImage,

@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ChatView } from "../src/chat/ChatView";
@@ -12,7 +12,14 @@ type ImageSender = (
   clientId: string,
   onProgress: (progress: number) => void,
   signal: AbortSignal,
+  replyToMessageId?: string,
 ) => Promise<void>;
+type ChatTestOptions = {
+  conversations?: Conversation[];
+  onSend?: (text: string, clientId: string, replyToMessageId?: string) => Promise<void>;
+  onPinMessage?: (messageId: string, pinned: boolean) => Promise<void>;
+  onForwardMessage?: (messageId: string, destinationConversationId: string, clientId: string) => Promise<void>;
+};
 const conversation: Conversation = {
   id: "507f1f77bcf86cd799439011",
   otherUser: {
@@ -77,6 +84,7 @@ function renderChat(
   onSendImage: ImageSender,
   messages: Message[] = [],
   chatConversation: Conversation = conversation,
+  options: ChatTestOptions = {},
 ) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   client.setQueryData<MessagePage>(["messages", chatConversation.id], { messages, nextCursor: null });
@@ -89,15 +97,36 @@ function renderChat(
     return (
       <ChatView
         conversation={chatConversation}
+        conversations={options.conversations ?? [chatConversation, conversation, groupConversation]}
         currentUserId="507f191e810c19729de860ea"
         messagesQuery={messagesQuery}
         socketConnected
         conversationJoined
         socketError=""
         onBack={() => undefined}
-        onSend={async () => undefined}
+        onSend={options.onSend ?? (async () => undefined)}
         onSendImage={onSendImage}
         onMarkRead={async () => undefined}
+        onEditMessage={async (messageId, text) => {
+          client.setQueryData<MessagePage>(["messages", chatConversation.id], (current) => ({
+            messages: (current?.messages ?? []).map((message) =>
+              message.id === messageId ? { ...message, text, editedAt: new Date().toISOString() } : message,
+            ),
+            nextCursor: current?.nextCursor ?? null,
+          }));
+        }}
+        onDeleteMessage={async (messageId) => {
+          client.setQueryData<MessagePage>(["messages", chatConversation.id], (current) => ({
+            messages: (current?.messages ?? []).map((message) =>
+              message.id === messageId
+                ? { ...message, text: "This message was deleted.", deletedAt: new Date().toISOString(), image: undefined }
+                : message,
+            ),
+            nextCursor: current?.nextCursor ?? null,
+          }));
+        }}
+        onPinMessage={options.onPinMessage ?? (async () => undefined)}
+        onForwardMessage={options.onForwardMessage ?? (async () => undefined)}
       />
     );
   }
@@ -110,6 +139,192 @@ function renderChat(
 }
 
 describe("image message composer", () => {
+  it("edits and confirms deletion of the current user's text message", async () => {
+    const message: Message = {
+      id: "507f1f77bcf86cd799439024",
+      conversationId: conversation.id,
+      senderId: "507f191e810c19729de860ea",
+      type: "text",
+      text: "Original message",
+      createdAt: "2026-01-01T12:00:00.000Z",
+    };
+    renderChat(async () => undefined, [message]);
+
+    fireEvent.click(screen.getByRole("button", { name: "More actions" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Edit" }));
+    const editor = screen.getByRole("textbox", { name: "Edit message" });
+    fireEvent.change(editor, { target: { value: "Updated message" } });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    });
+    expect(await screen.findByText("Updated message")).toBeInTheDocument();
+    expect(screen.getByText("Edited")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "More actions" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Unsend" }));
+    expect(screen.getByRole("group", { name: "Confirm message unsend" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
+    expect(await screen.findByText("This message was deleted.")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Edit" })).not.toBeInTheDocument();
+  });
+
+  it("offers compact actions to incoming messages without exposing owner-only actions", () => {
+    const incoming: Message = {
+      id: "507f1f77bcf86cd799439025",
+      conversationId: conversation.id,
+      senderId: "507f191e810c19729de860eb",
+      type: "text",
+      text: "Partner message",
+      createdAt: "2026-01-01T12:01:00.000Z",
+      sender: { displayName: "Chat Partner", avatarUrl: null },
+    };
+    renderChat(async () => undefined, [incoming]);
+
+    expect(screen.getByRole("button", { name: "Reply to Chat Partner" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "More actions" }));
+    expect(screen.getByRole("menuitem", { name: "Pin" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Forward" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Edit" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Unsend" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /reaction|emoji/i })).not.toBeInTheDocument();
+  });
+
+  it("supports menu keyboard navigation and Escape dismissal", async () => {
+    const ownMessage: Message = {
+      id: "507f1f77bcf86cd799439026",
+      conversationId: conversation.id,
+      senderId: "507f191e810c19729de860ea",
+      type: "text",
+      text: "My message",
+      createdAt: "2026-01-01T12:02:00.000Z",
+    };
+    renderChat(async () => undefined, [ownMessage]);
+    const trigger = screen.getByRole("button", { name: "More actions" });
+    fireEvent.click(trigger);
+    const menu = screen.getByRole("menu", { name: "More actions for message" });
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("menuitem", { name: "Edit" })));
+    fireEvent.keyDown(menu, { key: "End" });
+    expect(document.activeElement).toBe(screen.getByRole("menuitem", { name: "Forward" }));
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+    expect(trigger).toHaveFocus();
+  });
+
+  it("replies to a selected message and sends its stable message reference", async () => {
+    const ownMessage: Message = {
+      id: "507f1f77bcf86cd799439027",
+      conversationId: conversation.id,
+      senderId: "507f191e810c19729de860ea",
+      type: "text",
+      text: "Original text",
+      createdAt: "2026-01-01T12:03:00.000Z",
+    };
+    const onSend = vi.fn(async () => undefined);
+    renderChat(async () => undefined, [ownMessage], conversation, { onSend });
+
+    fireEvent.click(screen.getByRole("button", { name: "Reply to your message" }));
+    expect(screen.getByText("Replying to You")).toBeInTheDocument();
+    expect(screen.getAllByText("Original text")).toHaveLength(2);
+    fireEvent.change(screen.getByRole("textbox", { name: "Write a message" }), {
+      target: { value: "A response" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(onSend).toHaveBeenCalledWith(
+      "A response",
+      expect.any(String),
+      ownMessage.id,
+    ));
+    expect(screen.queryByRole("button", { name: "Cancel reply" })).not.toBeInTheDocument();
+  });
+
+  it("shows a deleted-original placeholder in replies", () => {
+    const deletedOriginal: Message = {
+      id: "507f1f77bcf86cd799439028",
+      conversationId: conversation.id,
+      senderId: "507f191e810c19729de860eb",
+      type: "text",
+      text: "This message was deleted.",
+      createdAt: "2026-01-01T12:04:00.000Z",
+      deletedAt: "2026-01-01T12:05:00.000Z",
+    };
+    const reply: Message = {
+      id: "507f1f77bcf86cd799439029",
+      conversationId: conversation.id,
+      senderId: "507f191e810c19729de860ea",
+      type: "text",
+      text: "Understood",
+      createdAt: "2026-01-01T12:06:00.000Z",
+      reply: {
+        id: deletedOriginal.id,
+        senderName: "Chat Partner",
+        text: "This message was deleted.",
+        type: "text",
+      },
+    };
+    renderChat(async () => undefined, [deletedOriginal, reply]);
+    expect(screen.getAllByText("This message was deleted.")).toHaveLength(2);
+    expect(screen.getByRole("button", {
+      name: "Go to reply target from Chat Partner: This message was deleted.",
+    })).toBeInTheDocument();
+  });
+
+  it("attaches the selected reply target when sending an image", async () => {
+    const original: Message = {
+      id: "507f1f77bcf86cd799439031",
+      conversationId: conversation.id,
+      senderId: "507f191e810c19729de860eb",
+      type: "image",
+      text: "",
+      createdAt: "2026-01-01T12:08:00.000Z",
+      image: {
+        contentType: "image/png",
+        size: 100,
+        width: 2,
+        height: 2,
+        url: `/api/v1/conversations/${conversation.id}/messages/507f1f77bcf86cd799439031/image`,
+      },
+      sender: { displayName: "Chat Partner", avatarUrl: null },
+    };
+    const calls: Parameters<ImageSender>[] = [];
+    renderChat(async (...args) => { calls.push(args); }, [original]);
+    fireEvent.click(screen.getByRole("button", { name: "Reply to Chat Partner" }));
+    expect(screen.getByText("Replying to Chat Partner")).toBeInTheDocument();
+
+    const image = new File(["image bytes"], "reply.png", { type: "image/png" });
+    fireEvent.change(screen.getByLabelText("Choose an image"), { target: { files: [image] } });
+    fireEvent.click(screen.getByRole("button", { name: "Send image" }));
+    await waitFor(() => expect(calls).toHaveLength(1));
+    expect(calls[0][5]).toBe(original.id);
+  });
+
+  it("pins and forwards through the More actions menu", async () => {
+    const ownMessage: Message = {
+      id: "507f1f77bcf86cd799439030",
+      conversationId: conversation.id,
+      senderId: "507f191e810c19729de860ea",
+      type: "text",
+      text: "Share this",
+      createdAt: "2026-01-01T12:07:00.000Z",
+    };
+    const onPinMessage = vi.fn(async () => undefined);
+    const onForwardMessage = vi.fn(async () => undefined);
+    renderChat(async () => undefined, [ownMessage], conversation, { onPinMessage, onForwardMessage });
+
+    fireEvent.click(screen.getByRole("button", { name: "More actions" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Pin" }));
+    await waitFor(() => expect(onPinMessage).toHaveBeenCalledWith(ownMessage.id, true));
+
+    fireEvent.click(screen.getByRole("button", { name: "More actions" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Forward" }));
+    expect(screen.getByRole("dialog", { name: "Forward message" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Forward" }));
+    await waitFor(() => expect(onForwardMessage).toHaveBeenCalledWith(
+      ownMessage.id,
+      groupConversation.id,
+      expect.any(String),
+    ));
+  });
+
   it("previews an image and lets the user remove it before sending", () => {
     const calls: Parameters<ImageSender>[] = [];
     const onSendImage: ImageSender = async (...args) => {
@@ -217,6 +432,8 @@ describe("image message composer", () => {
     expect(screen.getByRole("heading", { name: "Weekend plans" })).toBeInTheDocument();
     expect(screen.getByText("Group Partner")).toBeInTheDocument();
     expect(screen.getByText("See you there")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Edit" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Delete" })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Group details" }));
 
     expect(await screen.findByRole("dialog", { name: "Group details" })).toBeInTheDocument();

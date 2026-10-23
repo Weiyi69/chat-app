@@ -9,20 +9,46 @@ import { ChatView } from "./ChatView";
 import { ConversationSidebar } from "./ConversationSidebar";
 import { mergeMessages } from "./chat-utils";
 
+function mergeMessageIntoPage(current: MessagePage | undefined, message: Message): MessagePage {
+  const updatedReplies = (current?.messages ?? []).map((candidate) => {
+    if (candidate.reply?.id !== message.id) return candidate;
+    return {
+      ...candidate,
+      reply: {
+        id: message.id,
+        senderName: message.sender?.displayName ?? candidate.reply.senderName,
+        text: message.deletedAt
+          ? "This message was deleted."
+          : message.type === "image"
+            ? (message.text || "Photo")
+            : message.text,
+        type: message.type,
+      },
+    };
+  });
+  return {
+    messages: mergeMessages(updatedReplies, [message]),
+    nextCursor: current?.nextCursor ?? null,
+  };
+}
+
 function updateConversationPreview(current: Conversation[] | undefined, message: Message) {
   if (!current) return current;
   return current
-    .map((conversation) =>
-      conversation.id === message.conversationId
-        ? {
-            ...conversation,
-            latestMessage: {
-              text: (message.text || "[Image]").slice(0, 200),
-              createdAt: message.createdAt,
-            },
-          }
-        : conversation,
-    )
+    .map((conversation) => {
+      if (conversation.id !== message.conversationId) return conversation;
+      const latestAt = conversation.latestMessage?.createdAt;
+      if (latestAt && new Date(message.createdAt).getTime() < new Date(latestAt).getTime()) {
+        return conversation;
+      }
+      return {
+        ...conversation,
+        latestMessage: {
+          text: (message.text || "[Image]").slice(0, 200),
+          createdAt: message.createdAt,
+        },
+      };
+    })
     .sort(
       (first, second) =>
         new Date(second.latestMessage?.createdAt ?? 0).getTime() -
@@ -55,6 +81,7 @@ export function ChatWorkspace() {
       setSocketConnected(true);
       setSocketError("");
       void queryClient.invalidateQueries({ queryKey: ["receipts"] });
+      void queryClient.invalidateQueries({ queryKey: ["messages"] });
     };
     const onDisconnect = () => setSocketConnected(false);
     const onConnectError = () => {
@@ -62,10 +89,17 @@ export function ChatWorkspace() {
       setSocketError("Reconnecting to live messages...");
     };
     const onMessage = (message: Message) => {
-      queryClient.setQueryData<MessagePage>(["messages", message.conversationId], (current) => ({
-        messages: mergeMessages(current?.messages ?? [], [message]),
-        nextCursor: current?.nextCursor ?? null,
-      }));
+      queryClient.setQueryData<MessagePage>(["messages", message.conversationId], (current) =>
+        mergeMessageIntoPage(current, message),
+      );
+      queryClient.setQueryData<Conversation[]>(["conversations"], (current) =>
+        updateConversationPreview(current, message),
+      );
+    };
+    const onMessageUpdated = (message: Message) => {
+      queryClient.setQueryData<MessagePage>(["messages", message.conversationId], (current) =>
+        mergeMessageIntoPage(current, message),
+      );
       queryClient.setQueryData<Conversation[]>(["conversations"], (current) =>
         updateConversationPreview(current, message),
       );
@@ -83,6 +117,7 @@ export function ChatWorkspace() {
     socket.on("disconnect", onDisconnect);
     socket.on("connect_error", onConnectError);
     socket.on("message:new", onMessage);
+    socket.on("message:updated", onMessageUpdated);
     socket.on("group:updated", onGroupUpdated);
     socket.on("receipt:updated", onReceiptUpdated);
     socket.connect();
@@ -91,6 +126,7 @@ export function ChatWorkspace() {
       socket.off("disconnect", onDisconnect);
       socket.off("connect_error", onConnectError);
       socket.off("message:new", onMessage);
+      socket.off("message:updated", onMessageUpdated);
       socket.off("group:updated", onGroupUpdated);
       socket.off("receipt:updated", onReceiptUpdated);
       socket.disconnect();
@@ -121,13 +157,12 @@ export function ChatWorkspace() {
     if (activeId && !conversationsQuery.isLoading) setActiveId(null);
   }, [activeId, conversationsQuery.data, conversationsQuery.isLoading]);
 
-  async function sendMessage(text: string, clientId: string) {
+  async function sendMessage(text: string, clientId: string, replyToMessageId?: string) {
     if (!activeConversation) return;
-    const message = await chatApi.sendMessage(activeConversation.id, text, clientId);
-    queryClient.setQueryData<MessagePage>(["messages", activeConversation.id], (current) => ({
-      messages: mergeMessages(current?.messages ?? [], [message]),
-      nextCursor: current?.nextCursor ?? null,
-    }));
+    const message = await chatApi.sendMessage(activeConversation.id, text, clientId, replyToMessageId);
+    queryClient.setQueryData<MessagePage>(["messages", activeConversation.id], (current) =>
+      mergeMessageIntoPage(current, message),
+    );
     queryClient.setQueryData<Conversation[]>(["conversations"], (current) =>
       updateConversationPreview(current, message),
     );
@@ -139,6 +174,7 @@ export function ChatWorkspace() {
     clientId: string,
     onProgress: (progress: number) => void,
     signal: AbortSignal,
+    replyToMessageId?: string,
   ) {
     if (!activeConversation) return;
     const message = await chatApi.sendImage(
@@ -148,11 +184,11 @@ export function ChatWorkspace() {
       clientId,
       onProgress,
       signal,
+      replyToMessageId,
     );
-    queryClient.setQueryData<MessagePage>(["messages", activeConversation.id], (current) => ({
-      messages: mergeMessages(current?.messages ?? [], [message]),
-      nextCursor: current?.nextCursor ?? null,
-    }));
+    queryClient.setQueryData<MessagePage>(["messages", activeConversation.id], (current) =>
+      mergeMessageIntoPage(current, message),
+    );
     queryClient.setQueryData<Conversation[]>(["conversations"], (current) =>
       updateConversationPreview(current, message),
     );
@@ -176,6 +212,53 @@ export function ChatWorkspace() {
     });
   }
 
+  async function editMessage(
+    conversationId: string,
+    messageId: string,
+    text: string,
+    revision: number,
+  ) {
+    const message = await chatApi.editMessage(conversationId, messageId, text, revision);
+    onMessageUpdatedInCache(message);
+    return message;
+  }
+
+  async function deleteMessage(conversationId: string, messageId: string, revision: number) {
+    const message = await chatApi.deleteMessage(conversationId, messageId, revision);
+    onMessageUpdatedInCache(message);
+    return message;
+  }
+
+  async function setMessagePinned(messageId: string, pinned: boolean) {
+    if (!activeConversation) return;
+    const message = await chatApi.setMessagePinned(activeConversation.id, messageId, pinned);
+    onMessageUpdatedInCache(message);
+  }
+
+  async function forwardMessage(
+    messageId: string,
+    destinationConversationId: string,
+    clientId: string,
+  ) {
+    if (!activeConversation) return;
+    const message = await chatApi.forwardMessage(
+      activeConversation.id,
+      messageId,
+      destinationConversationId,
+      clientId,
+    );
+    onMessageUpdatedInCache(message);
+  }
+
+  function onMessageUpdatedInCache(message: Message) {
+    queryClient.setQueryData<MessagePage>(["messages", message.conversationId], (current) =>
+      mergeMessageIntoPage(current, message),
+    );
+    queryClient.setQueryData<Conversation[]>(["conversations"], (current) =>
+      updateConversationPreview(current, message),
+    );
+  }
+
   return (
     <main className={`workspace ${activeId ? "has-active-chat" : ""}`}>
       <ConversationSidebar
@@ -187,6 +270,7 @@ export function ChatWorkspace() {
         {activeConversation ? (
           <ChatView
             conversation={activeConversation}
+            conversations={conversationsQuery.data ?? []}
             currentUserId={user?.id ?? ""}
             messagesQuery={messagesQuery}
             socketConnected={socketConnected}
@@ -196,6 +280,12 @@ export function ChatWorkspace() {
             onSend={sendMessage}
             onSendImage={sendImage}
             onMarkRead={(messageId) => markRead(activeConversation.id, messageId)}
+            onEditMessage={(messageId, text, revision) =>
+              editMessage(activeConversation.id, messageId, text, revision)}
+            onDeleteMessage={(messageId, revision) =>
+              deleteMessage(activeConversation.id, messageId, revision)}
+            onPinMessage={setMessagePinned}
+            onForwardMessage={forwardMessage}
           />
         ) : (
           <div className="welcome-panel">

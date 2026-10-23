@@ -5,7 +5,6 @@ import {
   PutObjectCommand,
   S3Client,
 } from "@aws-sdk/client-s3";
-import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { mkdir, readFile, readdir, stat, writeFile, rm } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
 
@@ -25,8 +24,8 @@ export interface ImageStorage {
   readonly driver: "local" | "s3";
   put(key: string, data: Buffer, contentType: string): Promise<void>;
   delete(key: string): Promise<void>;
+  read(key: string): Promise<Buffer>;
   readLocal(key: string): Promise<Buffer>;
-  signedReadUrl(key: string): Promise<string>;
   listOlderThan(cutoff: Date, limit: number, cursor?: string): Promise<StoredImagePage>;
 }
 
@@ -64,8 +63,8 @@ class LocalImageStorage implements ImageStorage {
     return readFile(localPath(key));
   }
 
-  async signedReadUrl(): Promise<string> {
-    throw new Error("Signed URLs are only supported by S3-compatible storage");
+  async read(key: string): Promise<Buffer> {
+    return this.readLocal(key);
   }
 
   async listOlderThan(cutoff: Date, limit: number, cursor?: string): Promise<StoredImagePage> {
@@ -144,16 +143,16 @@ class S3ImageStorage implements ImageStorage {
     await this.client.send(new DeleteObjectCommand({ Bucket: this.bucket, Key: validateKey(key) }));
   }
 
-  async readLocal(): Promise<Buffer> {
-    throw new Error("Local reads are only supported by local image storage");
+  async read(key: string): Promise<Buffer> {
+    const response = await this.client.send(
+      new GetObjectCommand({ Bucket: this.bucket, Key: validateKey(key) }),
+    );
+    if (!response.Body) throw new Error("Stored image response has no body");
+    return Buffer.from(await response.Body.transformToByteArray());
   }
 
-  async signedReadUrl(key: string): Promise<string> {
-    return getSignedUrl(
-      this.client,
-      new GetObjectCommand({ Bucket: this.bucket, Key: validateKey(key) }),
-      { expiresIn: env.IMAGE_SIGNED_URL_TTL_SECONDS },
-    );
+  async readLocal(): Promise<Buffer> {
+    throw new Error("Local reads are only supported by local image storage");
   }
 
   async listOlderThan(cutoff: Date, limit: number, cursor?: string): Promise<StoredImagePage> {
