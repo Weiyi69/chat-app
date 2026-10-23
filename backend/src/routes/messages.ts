@@ -8,6 +8,11 @@ import { Message } from "../models/message.js";
 import { publishMessage, publishMessageUpdate } from "../sockets/realtime.js";
 import { findConversationForMember, listReadPositions } from "../services/conversations.js";
 import { createPersistedImageMessage, forwardPersistedMessage } from "../services/image-messages.js";
+import {
+  createPersistedFileMessage,
+  processUploadedAttachment,
+} from "../services/file-attachments.js";
+import { attachmentStorage } from "../services/attachment-storage.js";
 import { processUploadedImage } from "../services/image-processing.js";
 import { imageStorage } from "../services/image-storage.js";
 import {
@@ -17,6 +22,8 @@ import {
   editOwnMessage,
   getMessageReaders,
   getMessagePage,
+  getPinnedMessagePage,
+  getSharedFilesPage,
   getSharedMediaPage,
   setMessagePinned,
   serializeMessageForDelivery,
@@ -27,8 +34,10 @@ import {
   deleteMessageSchema,
   forwardMessageSchema,
   imageMessageUploadSchema,
+  fileMessageUploadSchema,
   messagePageQuerySchema,
   pinMessageSchema,
+  pinnedMessagePageQuerySchema,
   sharedMediaPageQuerySchema,
   sendMessageSchema,
 } from "../validators/messages.js";
@@ -70,6 +79,23 @@ const imageUpload = multer({
   },
 });
 
+const attachmentLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 10,
+  standardHeaders: "draft-8",
+  legacyHeaders: false,
+});
+
+const attachmentUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: env.ATTACHMENT_MAX_UPLOAD_BYTES,
+    files: 1,
+    fields: 3,
+    parts: 4,
+  },
+});
+
 messagesRouter.use(requireAuthentication);
 
 messagesRouter.get("/:conversationId/messages", async (request, response) => {
@@ -98,6 +124,38 @@ messagesRouter.get("/:conversationId/media", async (request, response) => {
 
   const query = sharedMediaPageQuerySchema.parse(request.query);
   const page = await getSharedMediaPage({
+    conversationId,
+    before: query.before,
+    limit: query.limit,
+  });
+  response.set("Cache-Control", "private, no-store").status(200).json(page);
+});
+
+messagesRouter.get("/:conversationId/files", async (request, response) => {
+  const conversationId = objectIdSchema.parse(request.params.conversationId);
+  const conversation = await findConversationForMember(conversationId, request.session.userId!);
+  if (!conversation || conversation.archivedAt) {
+    throw new ChatRequestError(404, "CONVERSATION_NOT_FOUND", "Conversation not found");
+  }
+
+  const query = sharedMediaPageQuerySchema.parse(request.query);
+  const page = await getSharedFilesPage({
+    conversationId,
+    before: query.before,
+    limit: query.limit,
+  });
+  response.set("Cache-Control", "private, no-store").status(200).json(page);
+});
+
+messagesRouter.get("/:conversationId/pins", async (request, response) => {
+  const conversationId = objectIdSchema.parse(request.params.conversationId);
+  const conversation = await findConversationForMember(conversationId, request.session.userId!);
+  if (!conversation || conversation.archivedAt) {
+    throw new ChatRequestError(404, "CONVERSATION_NOT_FOUND", "Conversation not found");
+  }
+
+  const query = pinnedMessagePageQuerySchema.parse(request.query);
+  const page = await getPinnedMessagePage({
     conversationId,
     before: query.before,
     limit: query.limit,
@@ -244,6 +302,79 @@ messagesRouter.post(
     const serialized = await serializeMessageForDelivery(message);
     await publishMessage(serialized);
     response.status(201).json({ message: serialized });
+  },
+);
+
+messagesRouter.post(
+  "/:conversationId/messages/file",
+  attachmentLimiter,
+  async (request, _response, next) => {
+    const conversationId = objectIdSchema.parse(request.params.conversationId);
+    const conversation = await findConversationForMember(conversationId, request.session.userId!);
+    if (!conversation || conversation.archivedAt) {
+      throw new ChatRequestError(404, "CONVERSATION_NOT_FOUND", "Conversation not found");
+    }
+    next();
+  },
+  attachmentUpload.single("attachment"),
+  async (request, response) => {
+    if (!request.file) {
+      throw new ChatRequestError(400, "ATTACHMENT_REQUIRED", "Choose a file to send.");
+    }
+    const parsed = fileMessageUploadSchema.safeParse(request.body);
+    if (!parsed.success) {
+      throw new ChatRequestError(400, "INVALID_ATTACHMENT", "Caption or retry identifier is invalid.");
+    }
+
+    const conversationId = objectIdSchema.parse(request.params.conversationId);
+    const attachment = await processUploadedAttachment({
+      data: request.file.buffer,
+      originalName: request.file.originalname,
+      declaredMimeType: request.file.mimetype,
+    });
+    const message = await createPersistedFileMessage({
+      conversationId,
+      senderId: request.session.userId!,
+      text: parsed.data.caption,
+      idempotencyKey: parsed.data.clientId,
+      attachment,
+      replyToMessageId: parsed.data.replyToMessageId,
+    });
+    const serialized = await serializeMessageForDelivery(message);
+    await publishMessage(serialized);
+    response.set("Cache-Control", "private, no-store").status(201).json({ message: serialized });
+  },
+);
+
+messagesRouter.get(
+  "/:conversationId/messages/:messageId/file",
+  async (request, response) => {
+    const conversationId = objectIdSchema.parse(request.params.conversationId);
+    const messageId = objectIdSchema.parse(request.params.messageId);
+    const conversation = await findConversationForMember(conversationId, request.session.userId!);
+    if (!conversation) {
+      throw new ChatRequestError(404, "ATTACHMENT_NOT_FOUND", "File not found");
+    }
+    const message = await Message.findOne({
+      _id: messageId,
+      conversationId,
+      type: "file",
+      deletedAt: { $exists: false },
+    }).lean();
+    if (!message?.file) {
+      throw new ChatRequestError(404, "ATTACHMENT_NOT_FOUND", "File not found");
+    }
+    const data = await attachmentStorage.read(message.file.storageKey);
+    response.set({
+      "Cache-Control": "private, no-store",
+      "Content-Security-Policy": "default-src 'none'; sandbox",
+      "Referrer-Policy": "no-referrer",
+      "X-Content-Type-Options": "nosniff",
+    });
+    response
+      .attachment(message.file.filename)
+      .set("Content-Type", message.file.contentType)
+      .send(data);
   },
 );
 

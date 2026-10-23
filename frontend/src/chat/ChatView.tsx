@@ -1,10 +1,10 @@
-import { useInfiniteQuery, useQuery, useQueryClient, type UseQueryResult } from "@tanstack/react-query";
+import { useInfiniteQuery, useQuery, useQueryClient, type InfiniteData, type UseQueryResult } from "@tanstack/react-query";
 import { useEffect, useRef, useState, type ChangeEvent, type KeyboardEvent, type RefObject } from "react";
-import { Info } from "lucide-react";
+import { File as FileIcon, FileSpreadsheet, FileText, Image as ImageIcon, Info, Paperclip, Pin } from "lucide-react";
 
 import { chatApi } from "../lib/api";
 import type { Conversation, GroupConversation, Message, MessagePage, ReadPosition } from "../types";
-import { Avatar, formatDate, formatTime, mergeMessages } from "./chat-utils";
+import { Avatar, formatDate, formatTime, mergeMessages, updatePinnedMessages } from "./chat-utils";
 import { ConversationInfoPanel } from "./ConversationInfoPanel";
 import { PrivateImage, PrivateImageViewer } from "./PrivateImage";
 
@@ -19,6 +19,7 @@ export function ChatView({
   onBack,
   onSend,
   onSendImage,
+  onSendFile,
   onMarkRead,
   onEditMessage,
   onDeleteMessage,
@@ -42,10 +43,18 @@ export function ChatView({
     signal: AbortSignal,
     replyToMessageId?: string,
   ) => Promise<void>;
+  onSendFile: (
+    file: File,
+    caption: string,
+    clientId: string,
+    onProgress: (progress: number) => void,
+    signal: AbortSignal,
+    replyToMessageId?: string,
+  ) => Promise<void>;
   onMarkRead: (messageId: string) => Promise<void>;
   onEditMessage: (messageId: string, text: string, revision: number) => Promise<unknown>;
   onDeleteMessage: (messageId: string, revision: number) => Promise<unknown>;
-  onPinMessage: (messageId: string, pinned: boolean) => Promise<void>;
+  onPinMessage: (messageId: string, pinned: boolean) => Promise<Message | void>;
   onForwardMessage: (messageId: string, destinationConversationId: string, clientId: string) => Promise<void>;
 }) {
   const [draft, setDraft] = useState("");
@@ -53,6 +62,8 @@ export function ChatView({
   const [sendError, setSendError] = useState("");
   const [imageRetryAvailable, setImageRetryAvailable] = useState(false);
   const [selectedImage, setSelectedImage] = useState<File | null>(null);
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [fileRetryAvailable, setFileRetryAvailable] = useState(false);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [viewerPath, setViewerPath] = useState<string | null>(null);
@@ -89,6 +100,7 @@ export function ChatView({
   const [forwardError, setForwardError] = useState("");
   const idempotencyKey = useRef<string | null>(null);
   const imageIdempotencyKey = useRef<string | null>(null);
+  const fileIdempotencyKey = useRef<string | null>(null);
   const previewUrlRef = useRef<string | null>(null);
   const uploadController = useRef<AbortController | null>(null);
   const viewerCloseRef = useRef<HTMLButtonElement>(null);
@@ -106,6 +118,11 @@ export function ChatView({
   const imageLimitsQuery = useQuery({
     queryKey: ["image-limits"],
     queryFn: chatApi.imageLimits,
+    staleTime: Infinity,
+  });
+  const attachmentLimitsQuery = useQuery({
+    queryKey: ["attachment-limits"],
+    queryFn: chatApi.attachmentLimits,
     staleTime: Infinity,
   });
   const isGroup = conversation.kind === "group";
@@ -129,7 +146,25 @@ export function ChatView({
     enabled: conversationInfoOpen,
     retry: false,
   });
+  const sharedFilesQuery = useInfiniteQuery({
+    queryKey: ["shared-files", conversation.id],
+    queryFn: ({ pageParam }) => chatApi.sharedFiles(conversation.id, pageParam),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (lastPage) => lastPage.nextCursor ?? undefined,
+    enabled: conversationInfoOpen,
+    retry: false,
+  });
+  const pinnedMessagesQuery = useInfiniteQuery({
+    queryKey: ["pinned-messages", conversation.id],
+    queryFn: ({ pageParam }) => chatApi.pinnedMessages(conversation.id, pageParam),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (lastPage) => lastPage.nextCursor ?? undefined,
+    retry: false,
+  });
+  const pinnedMessages = pinnedMessagesQuery.data?.pages.flatMap((page) => page.messages) ?? [];
+  const latestPinnedMessage = pinnedMessages[0];
   const sharedMediaMessages = sharedMediaQuery.data?.pages.flatMap((page) => page.messages) ?? [];
+  const sharedFileMessages = sharedFilesQuery.data?.pages.flatMap((page) => page.messages) ?? [];
   const groupMemberSearchQuery = useQuery({
     queryKey: ["group-member-search", groupMemberSearch],
     queryFn: () => chatApi.searchUsers(groupMemberSearch, undefined),
@@ -343,6 +378,14 @@ export function ChatView({
     setSendError("");
   }
 
+  function clearSelectedFile() {
+    setSelectedFile(null);
+    fileIdempotencyKey.current = null;
+    setFileRetryAvailable(false);
+    setUploadProgress(0);
+    setSendError("");
+  }
+
   function handleImageSelected(event: ChangeEvent<HTMLInputElement>) {
     const file = event.currentTarget.files?.[0];
     event.currentTarget.value = "";
@@ -361,15 +404,55 @@ export function ChatView({
     previewUrlRef.current = url;
     setPreviewUrl(url);
     setSelectedImage(file);
+    setSelectedFile(null);
+    fileIdempotencyKey.current = null;
+    setFileRetryAvailable(false);
     imageIdempotencyKey.current = null;
     setImageRetryAvailable(false);
     setSendError("");
     setUploadProgress(0);
   }
 
+  function handleFileSelected(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.currentTarget.files?.[0];
+    event.currentTarget.value = "";
+    if (!file) return;
+    const extension = file.name.split(".").at(-1)?.toLowerCase();
+    const allowedMimeTypes: Record<string, string[]> = {
+      pdf: ["application/pdf"],
+      txt: ["text/plain"],
+      docx: ["application/vnd.openxmlformats-officedocument.wordprocessingml.document"],
+      xlsx: ["application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"],
+      csv: ["text/csv", "application/csv", "application/vnd.ms-excel"],
+    };
+    const declaredMimeType = file.type.toLowerCase();
+    const missingBrowserMime = !declaredMimeType && extension !== undefined && Object.hasOwn(allowedMimeTypes, extension);
+    if (!extension || !Object.hasOwn(allowedMimeTypes, extension) || (
+      !missingBrowserMime && !allowedMimeTypes[extension]?.includes(declaredMimeType)
+    )) {
+      setSendError("Choose a PDF, TXT, DOCX, XLSX, or CSV file with a matching file type.");
+      return;
+    }
+    if (file.size > maxAttachmentBytes) {
+      setSendError(`Files must be ${formatUploadSize(maxAttachmentBytes)} or smaller.`);
+      return;
+    }
+    if (previewUrlRef.current) URL.revokeObjectURL(previewUrlRef.current);
+    previewUrlRef.current = null;
+    setPreviewUrl(null);
+    setSelectedImage(null);
+    imageIdempotencyKey.current = null;
+    setImageRetryAvailable(false);
+    setSelectedFile(file);
+    fileIdempotencyKey.current = null;
+    setFileRetryAvailable(false);
+    setSendError("");
+    setUploadProgress(0);
+  }
+
   async function sendDraft() {
     const text = draft.trim();
-    if ((!text && !selectedImage) || sending) return;
+    if ((!text && !selectedImage && !selectedFile) || sending) return;
     setSending(true);
     setSendError("");
     try {
@@ -387,6 +470,20 @@ export function ChatView({
           replyToMessageId ?? undefined,
         );
         clearSelectedImage();
+      } else if (selectedFile) {
+        fileIdempotencyKey.current ??= window.crypto.randomUUID();
+        const controller = new AbortController();
+        uploadController.current = controller;
+        setUploadProgress(0);
+        await onSendFile(
+          selectedFile,
+          text,
+          fileIdempotencyKey.current,
+          setUploadProgress,
+          controller.signal,
+          replyToMessageId ?? undefined,
+        );
+        clearSelectedFile();
       } else {
         idempotencyKey.current ??= window.crypto.randomUUID();
         await onSend(text, idempotencyKey.current, replyToMessageId ?? undefined);
@@ -397,11 +494,13 @@ export function ChatView({
       setReplyNavigationError("");
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") {
-        setSendError("Upload cancelled. You can retry sending the image.");
+        setSendError(`Upload cancelled. You can retry sending the ${selectedFile ? "file" : "image"}.`);
         if (selectedImage) setImageRetryAvailable(true);
+        if (selectedFile) setFileRetryAvailable(true);
       } else {
         setSendError(error instanceof Error ? error.message : "Message could not be sent. Try again.");
         if (selectedImage) setImageRetryAvailable(true);
+        if (selectedFile) setFileRetryAvailable(true);
       }
     } finally {
       uploadController.current = null;
@@ -535,6 +634,7 @@ export function ChatView({
 
   const title = isGroup ? conversation.name : conversation.otherUser.displayName;
   const maxGroupPhotoBytes = groupPhotoLimitsQuery.data?.maxUploadBytes ?? 5 * 1024 * 1024;
+  const maxAttachmentBytes = attachmentLimitsQuery.data?.maxUploadBytes ?? 10 * 1024 * 1024;
   const lastMessage = messages.at(-1);
 
   function markLatestVisibleMessageRead() {
@@ -606,13 +706,16 @@ export function ChatView({
   function getReplyExcerpt(message: Message) {
     if (message.deletedAt) return "This message was deleted";
     if (message.type === "image") return message.text ? `Photo: ${message.text}` : "Photo";
+    if (message.type === "file") return message.file?.filename ?? "File attachment";
     return message.text;
   }
 
   function startReply(message: Message) {
     idempotencyKey.current = null;
     imageIdempotencyKey.current = null;
+    fileIdempotencyKey.current = null;
     setImageRetryAvailable(false);
+    setFileRetryAvailable(false);
     setReplyToMessageId(message.id);
     setReplyNavigationError("");
     setOpenMenuMessageId(null);
@@ -653,6 +756,7 @@ export function ChatView({
       requestAnimationFrame(() => {
         const target = document.getElementById(`message-${messageId}`);
         target?.scrollIntoView?.({ behavior: "smooth", block: "center" });
+        target?.focus({ preventScroll: true });
         setHighlightedMessageId(messageId);
         window.setTimeout(() => setHighlightedMessageId(null), 1800);
       });
@@ -668,7 +772,14 @@ export function ChatView({
     setMessageActionErrorId(null);
     setOpenMenuMessageId(null);
     try {
-      await onPinMessage(message.id, !message.pinnedAt);
+      const updated = await onPinMessage(message.id, !message.pinnedAt);
+      if (updated) {
+        queryClient.setQueryData<InfiniteData<MessagePage, string | undefined>>(
+          ["pinned-messages", conversation.id],
+          (current) => updatePinnedMessages(current, updated),
+        );
+      }
+      void queryClient.invalidateQueries({ queryKey: ["pinned-messages", conversation.id] });
     } catch (error) {
       setMessageActionError(error instanceof Error ? error.message : "Pin status could not be updated.");
       setMessageActionErrorId(message.id);
@@ -799,7 +910,7 @@ export function ChatView({
           aria-expanded={conversationInfoOpen}
           onClick={() => {
             setMediaNavigationError("");
-            setConversationInfoOpen(true);
+            setConversationInfoOpen((open) => !open);
           }}
         >
           <Info size={19} aria-hidden="true" />
@@ -1017,6 +1128,22 @@ export function ChatView({
 
       <div className={`chat-content ${conversationInfoOpen ? "conversation-info-open" : ""}`}>
         <div className="chat-main-column">
+      {latestPinnedMessage && (
+        <div className="pinned-message-banner">
+          <button
+            type="button"
+            className="pinned-message-primary"
+            aria-label={`Go to pinned message: ${getPinnedMessagePreview(latestPinnedMessage)}`}
+            onClick={() => void navigateToOriginal(latestPinnedMessage.id)}
+          >
+            <Pin size={16} aria-label="Pinned message" role="img" />
+            <span className="pinned-message-copy">
+              <span className="pinned-message-label">Pinned message</span>
+              <span className="pinned-message-preview">{getPinnedMessagePreview(latestPinnedMessage)}</span>
+            </span>
+          </button>
+        </div>
+      )}
       {socketError && <p className="connection-banner" role="status">{socketError}</p>}
 
       <div
@@ -1080,6 +1207,7 @@ export function ChatView({
               <div
                 id={`message-${message.id}`}
                 className={`message-row ${own ? "own" : ""} ${highlightedMessageId === message.id ? "highlighted" : ""}`}
+                tabIndex={-1}
               >
                 {!own && (
                   <Avatar name={senderName} avatarUrl={senderAvatar} />
@@ -1193,6 +1321,31 @@ export function ChatView({
                         }}
                       />
                       {message.text && <p className="image-caption">{message.text}</p>}
+                    </div>
+                  ) : message.type === "file" && message.file ? (
+                    <div className={`message-bubble file-message-bubble ${own ? "own" : ""}`}>
+                      <div className="message-file-card">
+                        <span className="message-file-icon" aria-hidden="true">
+                          <AttachmentIcon contentType={message.file.contentType} />
+                        </span>
+                        <span className="message-file-details">
+                          <span className="message-file-name" title={message.file.filename}>
+                            {message.file.filename}
+                          </span>
+                          <span className="message-file-meta">
+                            {formatAttachmentType(message.file.contentType)} · {formatUploadSize(message.file.size)}
+                          </span>
+                        </span>
+                        <a
+                          className="message-file-download"
+                          href={message.file.url}
+                          download={message.file.filename}
+                          aria-label={`Download ${message.file.filename}`}
+                        >
+                          Download
+                        </a>
+                      </div>
+                      {message.text && <p className="file-caption">{message.text}</p>}
                     </div>
                   ) : (
                     <div className={`message-bubble ${own ? "own" : ""}`}>{message.text}</div>
@@ -1322,7 +1475,9 @@ export function ChatView({
                 setReplyToMessageId(null);
                 idempotencyKey.current = null;
                 imageIdempotencyKey.current = null;
+                fileIdempotencyKey.current = null;
                 setImageRetryAvailable(false);
+                setFileRetryAvailable(false);
               }}
               disabled={sending}
             >
@@ -1357,14 +1512,54 @@ export function ChatView({
             )}
           </div>
         )}
+        {selectedFile && (
+          <div className="image-preview file-preview">
+            <span className="preview-file-icon" aria-hidden="true">
+              <AttachmentIcon contentType={contentTypeForFilename(selectedFile.name)} />
+            </span>
+            <div className="image-preview-details">
+              <span title={selectedFile.name}>{selectedFile.name}</span>
+              <span>{selectedFile.type || "Document"} · {formatUploadSize(selectedFile.size)}</span>
+              {sending && (
+                <>
+                  <progress aria-label="File upload progress" max={100} value={uploadProgress} />
+                  <span role="status">Uploading file: {uploadProgress}%</span>
+                </>
+              )}
+            </div>
+            {sending ? (
+              <button
+                type="button"
+                className="quiet-button"
+                onClick={() => uploadController.current?.abort()}
+              >
+                Cancel upload
+              </button>
+            ) : (
+              <button type="button" className="quiet-button" onClick={clearSelectedFile}>
+                Remove file
+              </button>
+            )}
+          </div>
+        )}
         <div className="composer-box">
-          <label className="attach-button" aria-label="Attach an image" title="Attach an image">
-            <span aria-hidden="true">＋</span>
+          <label className="attach-button" aria-label="Attach image" title="Attach image">
+            <ImageIcon size={19} aria-hidden="true" />
             <input
               type="file"
               accept="image/jpeg,image/png,image/webp"
               aria-label="Choose an image"
               onChange={handleImageSelected}
+              disabled={sending}
+            />
+          </label>
+          <label className="attach-button" aria-label="Attach file" title="Attach file">
+            <Paperclip size={18} aria-hidden="true" />
+            <input
+              type="file"
+              accept=".pdf,.txt,.docx,.xlsx,.csv,application/pdf,text/plain,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/csv"
+              aria-label="Choose a file"
+              onChange={handleFileSelected}
               disabled={sending}
             />
           </label>
@@ -1377,6 +1572,9 @@ export function ChatView({
               if (selectedImage) {
                 imageIdempotencyKey.current = null;
                 setImageRetryAvailable(false);
+              } else if (selectedFile) {
+                fileIdempotencyKey.current = null;
+                setFileRetryAvailable(false);
               } else {
                 idempotencyKey.current = null;
               }
@@ -1390,21 +1588,27 @@ export function ChatView({
           <button
             className="send-button"
             type="submit"
-            disabled={(!draft.trim() && !selectedImage) || sending}
+            disabled={(!draft.trim() && !selectedImage && !selectedFile) || sending}
             aria-label={
               sending
                 ? "Sending message"
-                : selectedImage && imageRetryAvailable
-                  ? "Retry image"
+                : selectedFile && fileRetryAvailable
+                  ? "Retry file"
+                  : selectedImage && imageRetryAvailable
+                    ? "Retry image"
                   : selectedImage
                     ? "Send image"
+                    : selectedFile
+                      ? "Send file"
                     : "Send message"
             }
           >
-            {sending ? "..." : selectedImage && sendError ? "Retry" : "↑"}
+            {sending ? "..." : (selectedImage || selectedFile) && sendError ? "Retry" : "↑"}
           </button>
         </div>
-        <span className="composer-hint">Enter to send · Shift + Enter for a new line</span>
+        <span className="composer-hint">
+          Enter to send · Shift + Enter for a new line · Documents up to {formatUploadSize(maxAttachmentBytes)}
+        </span>
       </form>
         </div>
         {conversationInfoOpen && (
@@ -1418,14 +1622,27 @@ export function ChatView({
               conversation={conversation}
               groupDetails={groupDetails}
               messages={sharedMediaMessages}
+              files={sharedFileMessages}
+              pinnedMessages={pinnedMessages}
               loading={sharedMediaQuery.isLoading}
               loadingMore={sharedMediaQuery.isFetchingNextPage}
               error={Boolean(sharedMediaQuery.error)}
               navigationError={mediaNavigationError}
               hasMore={Boolean(sharedMediaQuery.hasNextPage)}
-              onClose={closeConversationInfo}
               onRetry={() => void sharedMediaQuery.refetch()}
               onLoadMore={() => void sharedMediaQuery.fetchNextPage()}
+              filesLoading={sharedFilesQuery.isLoading}
+              filesLoadingMore={sharedFilesQuery.isFetchingNextPage}
+              filesError={Boolean(sharedFilesQuery.error)}
+              filesHasMore={Boolean(sharedFilesQuery.hasNextPage)}
+              onRetryFiles={() => void sharedFilesQuery.refetch()}
+              onLoadMoreFiles={() => void sharedFilesQuery.fetchNextPage()}
+              pinsLoading={pinnedMessagesQuery.isLoading}
+              pinsLoadingMore={pinnedMessagesQuery.isFetchingNextPage}
+              pinsError={Boolean(pinnedMessagesQuery.error)}
+              pinsHasMore={Boolean(pinnedMessagesQuery.hasNextPage)}
+              onRetryPins={() => void pinnedMessagesQuery.refetch()}
+              onLoadMorePins={() => void pinnedMessagesQuery.fetchNextPage()}
               onOpenImage={(path, message, trigger) => {
                 viewerTriggerRef.current = trigger;
                 setViewerMessageId(message.id);
@@ -1539,6 +1756,69 @@ export function ChatView({
   );
 }
 
+function getPinnedMessagePreview(message: Message): string {
+  if (message.deletedAt) return "This message was deleted.";
+  if (message.type === "image") return "Pinned image";
+  if (message.type === "file") return "Pinned file";
+  const text = message.text.replace(/\s+/g, " ").trim();
+  const characters = Array.from(text);
+  return characters.length > 120 ? `${characters.slice(0, 117).join("")}...` : text || "Pinned message";
+}
+
+function contentTypeForFilename(filename: string): NonNullable<Message["file"]>["contentType"] {
+  const extension = filename.split(".").at(-1)?.toLowerCase();
+  switch (extension) {
+    case "txt":
+      return "text/plain";
+    case "docx":
+      return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+    case "xlsx":
+      return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+    case "csv":
+      return "text/csv";
+    default:
+      return "application/pdf";
+  }
+}
+
+function formatAttachmentType(contentType: NonNullable<Message["file"]>["contentType"]): string {
+  switch (contentType) {
+    case "application/pdf":
+      return "PDF";
+    case "text/plain":
+      return "Text";
+    case "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+      return "Word document";
+    case "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":
+      return "Spreadsheet";
+    case "text/csv":
+      return "CSV";
+  }
+}
+
+function AttachmentIcon({
+  contentType,
+  size = 20,
+}: {
+  contentType: NonNullable<Message["file"]>["contentType"];
+  size?: number;
+}) {
+  if (
+    contentType === "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" ||
+    contentType === "text/csv"
+  ) {
+    return <FileSpreadsheet size={size} aria-hidden="true" />;
+  }
+  if (
+    contentType === "application/pdf" ||
+    contentType === "text/plain" ||
+    contentType === "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+  ) {
+    return <FileText size={size} aria-hidden="true" />;
+  }
+  return <FileIcon size={size} aria-hidden="true" />;
+}
+
 function MessageActionToolbar({
   message,
   own,
@@ -1570,7 +1850,7 @@ function MessageActionToolbar({
   onMenuKeyDown: (event: KeyboardEvent<HTMLDivElement>) => void;
   hasDestinations: boolean;
 }) {
-  const canForward = message.type === "text" || Boolean(message.image?.url);
+  const canForward = message.type === "text" || Boolean(message.image?.url || message.file?.url);
   return (
     <div className={`message-action-toolbar ${own ? "own" : "incoming"}`} aria-label="Message actions">
       <button

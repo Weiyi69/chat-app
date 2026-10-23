@@ -14,11 +14,13 @@ type ImageSender = (
   signal: AbortSignal,
   replyToMessageId?: string,
 ) => Promise<void>;
+type FileSender = ImageSender;
 type ChatTestOptions = {
   conversations?: Conversation[];
   onSend?: (text: string, clientId: string, replyToMessageId?: string) => Promise<void>;
-  onPinMessage?: (messageId: string, pinned: boolean) => Promise<void>;
+  onPinMessage?: (messageId: string, pinned: boolean) => Promise<Message | void>;
   onForwardMessage?: (messageId: string, destinationConversationId: string, clientId: string) => Promise<void>;
+  onSendFile?: FileSender;
 };
 const conversation: Conversation = {
   id: "507f1f77bcf86cd799439011",
@@ -57,6 +59,10 @@ const groupConversation: GroupConversation = {
 };
 
 beforeAll(() => {
+  Object.defineProperty(Element.prototype, "scrollIntoView", {
+    configurable: true,
+    value: vi.fn(),
+  });
   Object.defineProperty(URL, "createObjectURL", {
     configurable: true,
     value: vi.fn(() => "blob:test-image"),
@@ -78,7 +84,20 @@ beforeEach(() => {
     maxUploadBytes: 5 * 1024 * 1024,
     contentTypes: ["image/jpeg", "image/png", "image/webp"],
   });
+  vi.spyOn(chatApi, "attachmentLimits").mockResolvedValue({
+    maxUploadBytes: 10 * 1024 * 1024,
+    contentTypes: [
+      "application/pdf",
+      "text/plain",
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      "text/csv",
+    ],
+    extensions: ["pdf", "txt", "docx", "xlsx", "csv"],
+  });
   vi.spyOn(chatApi, "sharedMedia").mockResolvedValue({ messages: [], nextCursor: null });
+  vi.spyOn(chatApi, "sharedFiles").mockResolvedValue({ messages: [], nextCursor: null });
+  vi.spyOn(chatApi, "pinnedMessages").mockResolvedValue({ messages: [], nextCursor: null });
 });
 
 function renderChat(
@@ -107,6 +126,7 @@ function renderChat(
         onBack={() => undefined}
         onSend={options.onSend ?? (async () => undefined)}
         onSendImage={onSendImage}
+        onSendFile={options.onSendFile ?? (async () => undefined)}
         onMarkRead={async () => undefined}
         onEditMessage={async (messageId, text) => {
           client.setQueryData<MessagePage>(["messages", chatConversation.id], (current) => ({
@@ -126,7 +146,18 @@ function renderChat(
             nextCursor: current?.nextCursor ?? null,
           }));
         }}
-        onPinMessage={options.onPinMessage ?? (async () => undefined)}
+        onPinMessage={async (messageId, pinned) => {
+          const updated = await options.onPinMessage?.(messageId, pinned);
+          if (updated) {
+            client.setQueryData<MessagePage>(["messages", chatConversation.id], (current) => ({
+              messages: (current?.messages ?? []).map((message) =>
+                message.id === updated.id ? updated : message,
+              ),
+              nextCursor: current?.nextCursor ?? null,
+            }));
+          }
+          return updated;
+        }}
         onForwardMessage={options.onForwardMessage ?? (async () => undefined)}
       />
     );
@@ -165,7 +196,8 @@ describe("image message composer", () => {
     fireEvent.click(screen.getByRole("menuitem", { name: "Unsend" }));
     expect(screen.getByRole("group", { name: "Confirm message unsend" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
-    expect(await screen.findByText("This message was deleted.")).toBeInTheDocument();
+    const deletedPlaceholder = await screen.findByText("This message was deleted.");
+    expect(deletedPlaceholder).toHaveClass("message-bubble", "deleted-message", "own");
     expect(screen.queryByRole("button", { name: "Edit" })).not.toBeInTheDocument();
   });
 
@@ -326,6 +358,145 @@ describe("image message composer", () => {
     ));
   });
 
+  it("updates the banner after confirmed pin and unpin actions", async () => {
+    const message: Message = {
+      id: "507f1f77bcf86cd799439044",
+      conversationId: conversation.id,
+      senderId: "507f191e810c19729de860ea",
+      type: "text",
+      text: "Pin this for later",
+      createdAt: "2026-01-01T12:09:00.000Z",
+    };
+    let pinnedMessages: Message[] = [];
+    let initialPinsLoaded = false;
+    vi.mocked(chatApi.pinnedMessages).mockImplementation(async () => {
+      initialPinsLoaded = true;
+      return { messages: pinnedMessages, nextCursor: null };
+    });
+    const onPinMessage = vi.fn(async (_messageId: string, pinned: boolean) => {
+      const updated = { ...message, ...(pinned ? { pinnedAt: "2026-01-02T12:00:00.000Z" } : {}) };
+      pinnedMessages = pinned ? [updated] : [];
+      return updated;
+    });
+    renderChat(async () => undefined, [message], conversation, { onPinMessage });
+    await waitFor(() => expect(initialPinsLoaded).toBe(true));
+
+    fireEvent.click(screen.getByRole("button", { name: "More actions" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Pin" }));
+    expect(await screen.findByRole("button", {
+      name: "Go to pinned message: Pin this for later",
+    })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "More actions" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Unpin" }));
+    await waitFor(() => expect(screen.queryByText("Pinned message")).not.toBeInTheDocument());
+    expect(onPinMessage).toHaveBeenNthCalledWith(1, message.id, true);
+    expect(onPinMessage).toHaveBeenNthCalledWith(2, message.id, false);
+  });
+
+  it("shows the latest pin in a direct chat and navigates to its message", async () => {
+    const pinnedMessage: Message = {
+      id: "507f1f77bcf86cd799439040",
+      conversationId: conversation.id,
+      senderId: conversation.otherUser.id,
+      type: "text",
+      text: "This is the latest pinned message",
+      createdAt: "2026-01-01T12:10:00.000Z",
+      pinnedAt: "2026-01-02T12:00:00.000Z",
+    };
+    vi.mocked(chatApi.pinnedMessages).mockResolvedValue({
+      messages: [pinnedMessage],
+      nextCursor: null,
+    });
+    renderChat(async () => undefined, [pinnedMessage]);
+
+    const banner = await screen.findByRole("button", {
+      name: "Go to pinned message: This is the latest pinned message",
+    });
+    expect(banner).toBeInTheDocument();
+    expect(screen.getByRole("img", { name: "Pinned message" })).toBeInTheDocument();
+    fireEvent.click(banner);
+
+    await waitFor(() => {
+      expect(document.getElementById(`message-${pinnedMessage.id}`)).toHaveClass("highlighted");
+    });
+  });
+
+  it("browses older group pins in conversation details with safe previews", async () => {
+    const recentFile: Message = {
+      id: "507f1f77bcf86cd799439041",
+      conversationId: groupConversation.id,
+      senderId: groupConversation.members[0].userId,
+      type: "file",
+      text: "Confidential file caption",
+      createdAt: "2026-01-01T12:12:00.000Z",
+      pinnedAt: "2026-01-03T12:00:00.000Z",
+      file: {
+        filename: "private-report.pdf",
+        contentType: "application/pdf",
+        size: 2048,
+        url: "/private/storage/path.pdf",
+      },
+    };
+    const deletedText: Message = {
+      id: "507f1f77bcf86cd799439042",
+      conversationId: groupConversation.id,
+      senderId: groupConversation.members[1].userId,
+      type: "text",
+      text: "This message was deleted.",
+      deletedAt: "2026-01-03T11:00:00.000Z",
+      createdAt: "2026-01-01T12:11:00.000Z",
+      pinnedAt: "2026-01-02T12:00:00.000Z",
+    };
+    const olderImage: Message = {
+      id: "507f1f77bcf86cd799439043",
+      conversationId: groupConversation.id,
+      senderId: groupConversation.members[1].userId,
+      type: "image",
+      text: "Private image caption",
+      createdAt: "2026-01-01T12:10:00.000Z",
+      pinnedAt: "2026-01-01T12:00:00.000Z",
+      image: {
+        contentType: "image/png",
+        size: 100,
+        width: 2,
+        height: 2,
+        url: "/private/storage/image.png",
+      },
+    };
+    vi.mocked(chatApi.pinnedMessages).mockImplementation(async (_conversationId, before) =>
+      before
+        ? { messages: [olderImage], nextCursor: null }
+        : { messages: [recentFile, deletedText], nextCursor: "older-pins" },
+    );
+    renderChat(async () => undefined, [recentFile, deletedText, olderImage], groupConversation);
+
+    const banner = await screen.findByRole("button", {
+      name: "Go to pinned message: Pinned file",
+    });
+    expect(banner).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Browse pinned messages" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Conversation information" }));
+    fireEvent.click(screen.getByRole("button", { name: "Chat info" }));
+    fireEvent.click(screen.getByRole("button", { name: "View pinned messages" }));
+    expect(await screen.findByRole("heading", { name: "Pinned messages" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Go to pinned message: This message was deleted." }))
+      .toBeInTheDocument();
+    expect(screen.getByRole("complementary", { name: "Pinned messages" }))
+      .not.toHaveTextContent("private-report.pdf");
+    expect(screen.getByRole("complementary", { name: "Pinned messages" }))
+      .not.toHaveTextContent("/private/storage/path.pdf");
+    fireEvent.click(screen.getByRole("button", { name: "Load more" }));
+    expect(await screen.findByRole("button", { name: "Go to pinned message: Pinned image" }))
+      .toBeInTheDocument();
+    expect(chatApi.pinnedMessages).toHaveBeenCalledWith(groupConversation.id, "older-pins");
+    fireEvent.click(screen.getByRole("button", { name: "Go to pinned message: Pinned image" }));
+
+    await waitFor(() => {
+      expect(document.getElementById(`message-${olderImage.id}`)).toHaveClass("highlighted");
+    });
+  });
+
   it("previews an image and lets the user remove it before sending", () => {
     const calls: Parameters<ImageSender>[] = [];
     const onSendImage: ImageSender = async (...args) => {
@@ -383,6 +554,70 @@ describe("image message composer", () => {
     await waitFor(() => expect(clientIds).toHaveLength(2));
     expect(clientIds[1]).toBe(clientIds[0]);
     expect(screen.queryByAltText("Selected image preview")).not.toBeInTheDocument();
+  });
+
+  it("previews a supported document, allows removal, and sends it with a retry id", async () => {
+    const onSendFile = vi.fn(async (
+      _file: File,
+      _caption: string,
+      _clientId: string,
+      onProgress: (progress: number) => void,
+    ) => {
+      onProgress(50);
+    });
+    renderChat(async () => undefined, [], conversation, { onSendFile });
+    const file = new File(["name,value"], "report.csv", { type: "text/csv" });
+    fireEvent.change(screen.getByLabelText("Choose a file"), { target: { files: [file] } });
+
+    expect(screen.getByText("report.csv")).toBeInTheDocument();
+    expect(screen.getByText("text/csv · 1 KB")).toBeInTheDocument();
+    expect(screen.getByText(/Documents up to/)).toHaveTextContent(/10\.0 MB/);
+    fireEvent.click(screen.getByRole("button", { name: "Remove file" }));
+    expect(screen.queryByText("report.csv")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Send message" })).toBeDisabled();
+
+    fireEvent.change(screen.getByLabelText("Choose a file"), { target: { files: [file] } });
+    fireEvent.click(screen.getByRole("button", { name: "Send file" }));
+    await waitFor(() => expect(onSendFile).toHaveBeenCalledTimes(1));
+    expect(onSendFile).toHaveBeenCalledWith(
+      file,
+      "",
+      expect.any(String),
+      expect.any(Function),
+      expect.any(AbortSignal),
+      undefined,
+    );
+    expect(screen.queryByText("report.csv")).not.toBeInTheDocument();
+  });
+
+  it("rejects a mismatched document type in the picker and renders file messages safely", () => {
+    renderChat(async () => undefined);
+    const spoofed = new File(["not a pdf"], "fake.pdf", { type: "text/plain" });
+    fireEvent.change(screen.getByLabelText("Choose a file"), { target: { files: [spoofed] } });
+    expect(screen.getByRole("alert")).toHaveTextContent("with a matching file type");
+    expect(screen.queryByText("fake.pdf")).not.toBeInTheDocument();
+
+    const message: Message = {
+      id: "507f1f77bcf86cd799439014",
+      conversationId: conversation.id,
+      senderId: conversation.otherUser.id,
+      type: "file",
+      text: "",
+      createdAt: "2026-01-01T12:00:00.000Z",
+      file: {
+        filename: "quarterly report.pdf",
+        contentType: "application/pdf",
+        size: 2048,
+        url: `/api/v1/conversations/${conversation.id}/messages/507f1f77bcf86cd799439014/file`,
+      },
+    };
+    renderChat(async () => undefined, [message]);
+    expect(screen.getByText("quarterly report.pdf")).toBeInTheDocument();
+    expect(screen.getByText("PDF · 2 KB")).toBeInTheDocument();
+    const file = message.file;
+    if (!file) throw new Error("Expected file metadata");
+    expect(screen.getByRole("link", { name: "Download quarterly report.pdf" }))
+      .toHaveAttribute("href", file.url);
   });
 
   it("loads a private image, opens the accessible viewer, and restores focus on close", async () => {
@@ -448,7 +683,11 @@ describe("image message composer", () => {
     fireEvent.click(infoButton);
 
     expect(await screen.findByRole("heading", { name: "Conversation information" })).toBeInTheDocument();
+    expect(infoButton).toHaveAttribute("aria-expanded", "true");
+    expect(screen.queryByRole("button", { name: "Close conversation information" })).not.toBeInTheDocument();
     expect(screen.getByText("I enjoy quiet mornings.")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Media & files" }));
+    fireEvent.click(screen.getByRole("button", { name: "Media" }));
     const openImageButton = await screen.findByRole("button", { name: "Open image" });
     expect(await screen.findByAltText("A shared photo")).toBeInTheDocument();
     fireEvent.click(openImageButton);
@@ -456,22 +695,28 @@ describe("image message composer", () => {
 
     fireEvent.keyDown(window, { key: "Escape" });
     await waitFor(() => expect(screen.queryByRole("dialog", { name: "Image viewer" })).not.toBeInTheDocument());
-    expect(screen.getByRole("heading", { name: "Conversation information" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Media" })).toBeInTheDocument();
     fireEvent.keyDown(window, { key: "Escape" });
     await waitFor(() => expect(screen.queryByRole("heading", { name: "Conversation information" })).not.toBeInTheDocument());
+    expect(infoButton).toHaveAttribute("aria-expanded", "false");
     expect(infoButton).toHaveFocus();
   });
 
-  it("shows group details and an empty media state in the information panel", async () => {
+  it("toggles the information panel from the header and shows group details and an empty media state", async () => {
     renderChat(async () => undefined, [], groupConversation);
-    fireEvent.click(screen.getByRole("button", { name: "Conversation information" }));
+    const infoButton = screen.getByRole("button", { name: "Conversation information" });
+    fireEvent.click(infoButton);
 
     expect(await screen.findByRole("heading", { name: "Conversation information" })).toBeInTheDocument();
+    expect(infoButton).toHaveAttribute("aria-expanded", "true");
     expect(screen.getAllByRole("heading", { name: "Weekend plans" })).toHaveLength(2);
     expect(screen.getAllByText("2 members")).toHaveLength(2);
+    fireEvent.click(screen.getByRole("button", { name: "Media & files" }));
+    fireEvent.click(screen.getByRole("button", { name: "Media" }));
     expect(await screen.findByText("No shared photos yet")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Close conversation information" }));
+    fireEvent.click(infoButton);
     await waitFor(() => expect(screen.queryByRole("heading", { name: "Conversation information" })).not.toBeInTheDocument());
+    expect(infoButton).toHaveAttribute("aria-expanded", "false");
   });
 
   it("shows media loading failures and retries successfully", async () => {
@@ -480,10 +725,82 @@ describe("image message composer", () => {
       .mockResolvedValue({ messages: [], nextCursor: null });
     renderChat(async () => undefined);
     fireEvent.click(screen.getByRole("button", { name: "Conversation information" }));
+    fireEvent.click(screen.getByRole("button", { name: "Media & files" }));
+    fireEvent.click(screen.getByRole("button", { name: "Media" }));
 
     expect(await screen.findByRole("alert")).toHaveTextContent("Shared photos could not be loaded.");
     fireEvent.click(screen.getByRole("button", { name: "Try again" }));
     expect(await screen.findByText("No shared photos yet")).toBeInTheDocument();
+  });
+
+  it("keeps Chat info and Media & files independently collapsible and opens nested destinations", async () => {
+    const fileMessage: Message = {
+      id: "507f1f77bcf86cd799439015",
+      conversationId: conversation.id,
+      senderId: conversation.otherUser.id,
+      type: "file",
+      text: "",
+      createdAt: "2026-01-01T12:00:00.000Z",
+      file: {
+        filename: "meeting notes.pdf",
+        contentType: "application/pdf",
+        size: 2048,
+        url: `/api/v1/conversations/${conversation.id}/messages/507f1f77bcf86cd799439015/file`,
+      },
+    };
+    vi.spyOn(chatApi, "sharedFiles").mockResolvedValue({ messages: [fileMessage], nextCursor: null });
+    renderChat(async () => undefined);
+    fireEvent.click(screen.getByRole("button", { name: "Conversation information" }));
+
+    const chatInfoToggle = screen.getByRole("button", { name: "Chat info" });
+    const mediaFilesToggle = screen.getByRole("button", { name: "Media & files" });
+    const profile = screen.getByRole("heading", { name: "Chat Partner", level: 3 });
+    expect(chatInfoToggle).toHaveAttribute("aria-expanded", "false");
+    expect(mediaFilesToggle).toHaveAttribute("aria-expanded", "false");
+    expect(profile.compareDocumentPosition(chatInfoToggle)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+    expect(profile).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "View pinned messages" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Media" })).not.toBeInTheDocument();
+
+    fireEvent.click(chatInfoToggle);
+    expect(chatInfoToggle).toHaveAttribute("aria-expanded", "true");
+    expect(profile).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "View pinned messages" })).toBeInTheDocument();
+    expect(mediaFilesToggle).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(mediaFilesToggle);
+    expect(mediaFilesToggle).toHaveAttribute("aria-expanded", "true");
+    expect(chatInfoToggle).toHaveAttribute("aria-expanded", "true");
+    fireEvent.click(chatInfoToggle);
+    expect(chatInfoToggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByRole("button", { name: "View pinned messages" })).not.toBeInTheDocument();
+    expect(mediaFilesToggle).toHaveAttribute("aria-expanded", "true");
+    fireEvent.click(mediaFilesToggle);
+    expect(mediaFilesToggle).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(mediaFilesToggle);
+
+    fireEvent.click(screen.getByRole("button", { name: "Files" }));
+    expect(await screen.findByRole("heading", { name: "Files" })).toBeInTheDocument();
+    expect(await screen.findByText("meeting notes.pdf")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Download meeting notes.pdf" })).toHaveAttribute("href", fileMessage.file?.url);
+    fireEvent.click(screen.getByRole("button", { name: "Back to conversation information" }));
+    fireEvent.click(screen.getByRole("button", { name: "Chat info" }));
+    fireEvent.click(screen.getByRole("button", { name: "View pinned messages" }));
+    expect(await screen.findByRole("heading", { name: "Pinned messages" })).toBeInTheDocument();
+    expect(await screen.findByText("No pinned messages yet")).toBeInTheDocument();
+  });
+
+  it("shows shared-file loading failures and supports retry", async () => {
+    vi.spyOn(chatApi, "sharedFiles")
+      .mockRejectedValueOnce(new Error("Files unavailable"))
+      .mockResolvedValue({ messages: [], nextCursor: null });
+    renderChat(async () => undefined);
+    fireEvent.click(screen.getByRole("button", { name: "Conversation information" }));
+    fireEvent.click(screen.getByRole("button", { name: "Media & files" }));
+    fireEvent.click(screen.getByRole("button", { name: "Files" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Shared files could not be loaded.");
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    expect(await screen.findByText("No shared files yet")).toBeInTheDocument();
   });
 
   it("shows the group name, sender attribution, and member details", async () => {

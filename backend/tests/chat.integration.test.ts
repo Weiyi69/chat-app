@@ -70,6 +70,10 @@ async function createFixtureAccount(displayName: string, email: string): Promise
     email,
     passwordHash: "fixture-account-password-hash",
   });
+  return createAuthenticatedFixture(user._id.toString());
+}
+
+async function createAuthenticatedFixture(userId: string): Promise<RegisteredAccount> {
   const agent = request.agent(baseUrl);
   const csrfResponse = await agent.get("/api/v1/auth/csrf").expect(200);
   const cookie = cookieHeader(csrfResponse);
@@ -85,14 +89,14 @@ async function createFixtureAccount(displayName: string, email: string): Promise
         reject(new Error("Expected the test session to be stored"));
         return;
       }
-      session.userId = user._id.toString();
+      session.userId = userId;
       sessionStore.set(sessionId, session, (saveError) => saveError ? reject(saveError) : resolve());
     });
   });
   const csrf = await agent.get("/api/v1/auth/csrf").expect(200);
   return {
     agent,
-    userId: user._id.toString(),
+    userId,
     cookie,
     csrfToken: csrf.body.token as string,
   };
@@ -781,6 +785,161 @@ describe("private chat integration", () => {
     eveSocket.disconnect();
   });
 
+  it("uploads, serves, retries, forwards, and deletes authorized file attachments", async () => {
+    if (!sharedAccounts) throw new Error("Expected private chat test accounts");
+    const alice = sharedAccounts.alice;
+    const bob = await createAuthenticatedFixture(sharedAccounts.bob.userId);
+    const eve = sharedAccounts.eve;
+    const dave = await createFixtureAccount("Attachment Dave", "attachment-dave@example.com");
+
+    const direct = await alice.agent
+      .post("/api/v1/conversations")
+      .set("x-csrf-token", alice.csrfToken)
+      .send({ otherUserId: bob.userId })
+      .expect(200);
+    const conversationId = direct.body.conversation.id as string;
+    const group = await alice.agent
+      .post("/api/v1/conversations/groups")
+      .set("x-csrf-token", alice.csrfToken)
+      .send({ name: "Attachment group", memberIds: [bob.userId, eve.userId] })
+      .expect(201);
+    const groupId = group.body.conversation.id as string;
+    const pdf = Buffer.from("%PDF-1.7\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n");
+    const clientId = "d9e1bb31-c64c-47a8-8d44-052ff1018f90";
+
+    await request(baseUrl)
+      .post(`/api/v1/conversations/${conversationId}/messages/file`)
+      .attach("attachment", pdf, { filename: "report.pdf", contentType: "application/pdf" })
+      .expect(403);
+    await request(baseUrl)
+      .get(`/api/v1/conversations/${conversationId}/messages/${clientId}/file`)
+      .expect(401);
+    await dave.agent
+      .post(`/api/v1/conversations/${conversationId}/messages/file`)
+      .set("x-csrf-token", dave.csrfToken)
+      .field("clientId", randomUUID())
+      .attach("attachment", pdf, { filename: "report.pdf", contentType: "application/pdf" })
+      .expect(404);
+    await alice.agent
+      .post(`/api/v1/conversations/${conversationId}/messages/file`)
+      .set("x-csrf-token", alice.csrfToken)
+      .field("clientId", randomUUID())
+      .attach("attachment", Buffer.from("not a PDF"), { filename: "spoofed.pdf", contentType: "application/pdf" })
+      .expect(415);
+    await alice.agent
+      .post(`/api/v1/conversations/${conversationId}/messages/file`)
+      .set("x-csrf-token", alice.csrfToken)
+      .field("clientId", randomUUID())
+      .attach("attachment", Buffer.alloc(10 * 1024 * 1024 + 1), { filename: "oversized.txt", contentType: "text/plain" })
+      .expect(413);
+
+    const bobSocket = await connectSocket(bob.cookie);
+    expect((await joinConversation(bobSocket, conversationId)).ok).toBe(true);
+    const received = new Promise<{ id: string; type: string; file?: { filename: string } }>((resolve) => {
+      bobSocket.once("message:new", resolve);
+    });
+    const uploaded = await alice.agent
+      .post(`/api/v1/conversations/${conversationId}/messages/file`)
+      .set("x-csrf-token", alice.csrfToken)
+      .field("clientId", clientId)
+      .field("caption", "Quarterly report")
+      .attach("attachment", pdf, { filename: "report.pdf", contentType: "application/pdf" })
+      .expect(201);
+    const message = uploaded.body.message as {
+      id: string;
+      type: string;
+      revision: number;
+      file: { filename: string; contentType: string; size: number; url: string };
+    };
+    expect(message).toMatchObject({
+      type: "file",
+      text: "Quarterly report",
+      file: { filename: "report.pdf", contentType: "application/pdf", size: pdf.length },
+    });
+    await expect(received).resolves.toMatchObject({
+      id: message.id,
+      type: "file",
+      file: { filename: "report.pdf" },
+    });
+    expect(message.file.url).toBe(
+      `/api/v1/conversations/${conversationId}/messages/${message.id}/file`,
+    );
+    expect(uploaded.body.message.file).not.toHaveProperty("storageKey");
+
+    const duplicate = await alice.agent
+      .post(`/api/v1/conversations/${conversationId}/messages/file`)
+      .set("x-csrf-token", alice.csrfToken)
+      .field("clientId", clientId)
+      .field("caption", "Quarterly report")
+      .attach("attachment", pdf, { filename: "report.pdf", contentType: "application/pdf" })
+      .expect(201);
+    expect(duplicate.body.message.id).toBe(message.id);
+    await alice.agent
+      .post(`/api/v1/conversations/${conversationId}/messages/file`)
+      .set("x-csrf-token", alice.csrfToken)
+      .field("clientId", clientId)
+      .field("caption", "Different content")
+      .attach("attachment", pdf, { filename: "report.pdf", contentType: "application/pdf" })
+      .expect(409);
+
+    const download = await bob.agent.get(message.file.url).expect(200);
+    expect(download.body).toEqual(pdf);
+    expect(download.headers["content-disposition"]).toContain("attachment");
+    expect(download.headers["content-type"]).toContain("application/pdf");
+    await eve.agent.get(message.file.url).expect(404);
+    await request(baseUrl).get(message.file.url).expect(401);
+    await bob.agent
+      .get(`/api/v1/conversations/${groupId}/messages/${message.id}/file`)
+      .expect(404);
+
+    const forwarded = await alice.agent
+      .post(`/api/v1/conversations/${conversationId}/messages/${message.id}/forward`)
+      .set("x-csrf-token", alice.csrfToken)
+      .send({ destinationConversationId: groupId, clientId: randomUUID() })
+      .expect(201);
+    const forwardedFile = forwarded.body.message.file as typeof message.file;
+    expect(forwardedFile.filename).toBe("report.pdf");
+    expect(forwardedFile.url).not.toBe(message.file.url);
+    expect((await eve.agent.get(forwardedFile.url).expect(200)).body).toEqual(pdf);
+    await dave.agent.get(forwardedFile.url).expect(404);
+    const sourceRecord = await Message.findById(message.id).select("file.storageKey").lean();
+    const forwardedRecord = await Message.findById(
+      (forwarded.body.message as { id: string }).id,
+    ).select("file.storageKey").lean();
+    expect(forwardedRecord?.file?.storageKey).not.toBe(sourceRecord?.file?.storageKey);
+    expect(await Message.countDocuments({
+      conversationId,
+      senderId: alice.userId,
+      idempotencyKey: clientId,
+    })).toBe(1);
+
+    const groupUpload = await bob.agent
+      .post(`/api/v1/conversations/${groupId}/messages/file`)
+      .set("x-csrf-token", bob.csrfToken)
+      .field("clientId", randomUUID())
+      .attach("attachment", Buffer.from("name,value\nConverse,1\n"), {
+        filename: "group.csv",
+        contentType: "text/csv",
+      })
+      .expect(201);
+    await eve.agent.get((groupUpload.body.message as { file: { url: string } }).file.url).expect(200);
+    await dave.agent
+      .post(`/api/v1/conversations/${groupId}/messages/file`)
+      .set("x-csrf-token", dave.csrfToken)
+      .field("clientId", randomUUID())
+      .attach("attachment", pdf, { filename: "report.pdf", contentType: "application/pdf" })
+      .expect(404);
+
+    await alice.agent
+      .delete(`/api/v1/conversations/${conversationId}/messages/${message.id}`)
+      .set("x-csrf-token", alice.csrfToken)
+      .send({ revision: message.revision })
+      .expect(200);
+    await bob.agent.get(message.file.url).expect(404);
+    await eve.agent.get(forwardedFile.url).expect(200);
+    bobSocket.disconnect();
+  });
+
   it("creates secure groups, persists group messages, enforces roles, and archives empty groups", async () => {
     if (!sharedAccounts) throw new Error("Expected private chat test accounts");
     const alice = sharedAccounts.alice;
@@ -948,16 +1107,73 @@ describe("private chat integration", () => {
       .send({ pinned: true })
       .expect(200);
     expect(duplicatePin.body.message.pinnedAt).toBe(pinnedAt);
+    const secondPinUpdate = new Promise<{ id: string; pinnedAt?: string }>((resolve) => {
+      bobSocket.once("message:updated", resolve);
+    });
+    await new Promise((resolve) => setTimeout(resolve, 2));
+    const secondPin = await bob.agent
+      .put(`/api/v1/conversations/${groupId}/messages/${replied.body.message.id}/pin`)
+      .set("x-csrf-token", bob.csrfToken)
+      .send({ pinned: true })
+      .expect(200);
+    await expect(secondPinUpdate).resolves.toMatchObject({
+      id: replied.body.message.id,
+      pinnedAt: secondPin.body.message.pinnedAt,
+    });
+    const firstPinsPage = await alice.agent
+      .get(`/api/v1/conversations/${groupId}/pins?limit=1`)
+      .expect(200);
+    expect(firstPinsPage.body.messages).toHaveLength(1);
+    expect(firstPinsPage.body.messages[0]).toMatchObject({
+      id: replied.body.message.id,
+      text: "A reply in the group",
+    });
+    expect(firstPinsPage.body.nextCursor).toBeTruthy();
+    const secondPinsPage = await alice.agent
+      .get(`/api/v1/conversations/${groupId}/pins?limit=1&before=${encodeURIComponent(firstPinsPage.body.nextCursor as string)}`)
+      .expect(200);
+    expect(secondPinsPage.body.messages[0].id).toBe(firstMessage.body.message.id);
+    await eve.agent.get(`/api/v1/conversations/${groupId}/pins`).expect(200);
+    await dave.agent.get(`/api/v1/conversations/${groupId}/pins`).expect(404);
+    await request(baseUrl).get(`/api/v1/conversations/${groupId}/pins`).expect(401);
     await dave.agent
       .put(`/api/v1/conversations/${groupId}/messages/${firstMessage.body.message.id}/pin`)
       .set("x-csrf-token", dave.csrfToken)
       .send({ pinned: true })
       .expect(404);
-    await bob.agent
+    const unpinUpdate = new Promise<{ id: string; pinnedAt?: string }>((resolve) => {
+      bobSocket.once("message:updated", resolve);
+    });
+    const unpinned = await bob.agent
       .put(`/api/v1/conversations/${groupId}/messages/${firstMessage.body.message.id}/pin`)
       .set("x-csrf-token", bob.csrfToken)
       .send({ pinned: false })
       .expect(200);
+    expect(unpinned.body.message).not.toHaveProperty("pinnedAt");
+    const afterUnpin = await alice.agent
+      .get(`/api/v1/conversations/${groupId}/pins`)
+      .expect(200);
+    expect(afterUnpin.body.messages.map((message: { id: string }) => message.id))
+      .toEqual([replied.body.message.id]);
+    const unpinEvent = await unpinUpdate;
+    expect(unpinEvent.id).toBe(firstMessage.body.message.id);
+    expect(unpinEvent).not.toHaveProperty("pinnedAt");
+    await bob.agent
+      .delete(`/api/v1/conversations/${groupId}/messages/${replied.body.message.id}`)
+      .set("x-csrf-token", bob.csrfToken)
+      .send({ revision: secondPin.body.message.revision })
+      .expect(200);
+    const deletedPinPage = await alice.agent
+      .get(`/api/v1/conversations/${groupId}/pins`)
+      .expect(200);
+    expect(deletedPinPage.body.messages).toHaveLength(1);
+    expect(deletedPinPage.body.messages[0]).toMatchObject({
+      id: replied.body.message.id,
+      text: "This message was deleted.",
+      deletedAt: expect.any(String),
+    });
+    expect(deletedPinPage.body.messages[0]).not.toHaveProperty("image");
+    expect(deletedPinPage.body.messages[0]).not.toHaveProperty("file");
 
     const forwardedEvent = new Promise<{ conversationId: string; senderId: string; forwardedFrom?: { senderName: string } }>(
       (resolve) => aliceSocket.once("message:new", resolve),
@@ -1031,10 +1247,20 @@ describe("private chat integration", () => {
       .expect(404);
 
     const directMessage = await Message.findOne({
-      conversationId: { $ne: new mongoose.Types.ObjectId(groupId) },
+      conversationId: new mongoose.Types.ObjectId(directId),
       senderId: new mongoose.Types.ObjectId(alice.userId),
+      deletedAt: { $exists: false },
     }).select("_id __v").lean();
     if (!directMessage) throw new Error("Expected an Alice direct message for cross-conversation test");
+    await alice.agent
+      .put(`/api/v1/conversations/${directId}/messages/${directMessage._id.toString()}/pin`)
+      .set("x-csrf-token", alice.csrfToken)
+      .send({ pinned: true })
+      .expect(200);
+    const directPins = await bob.agent.get(`/api/v1/conversations/${directId}/pins`).expect(200);
+    expect(directPins.body.messages.map((message: { id: string }) => message.id))
+      .toContain(directMessage._id.toString());
+    await eve.agent.get(`/api/v1/conversations/${directId}/pins`).expect(404);
     await alice.agent
       .patch(`/api/v1/conversations/${groupId}/messages/${directMessage._id.toString()}`)
       .set("x-csrf-token", alice.csrfToken)
@@ -1601,6 +1827,73 @@ describe("private chat integration", () => {
     expect(thirdPage.body.nextCursor).toBeNull();
     expect(new Set(listedIds).size).toBe(25);
     expect(listedIds).not.toContain(deletedImage._id.toString());
+  });
+
+  it("paginates authorized conversation files and excludes deleted and unrelated attachments", async () => {
+    const alice = await createFixtureAccount("Files Alice", "files-alice@example.com");
+    const bob = await createFixtureAccount("Files Bob", "files-bob@example.com");
+    const outsider = await createFixtureAccount("Files Outsider", "files-outsider@example.com");
+    const created = await alice.agent
+      .post("/api/v1/conversations")
+      .set("x-csrf-token", alice.csrfToken)
+      .send({ otherUserId: bob.userId })
+      .expect(200);
+    const other = await alice.agent
+      .post("/api/v1/conversations")
+      .set("x-csrf-token", alice.csrfToken)
+      .send({ otherUserId: outsider.userId })
+      .expect(200);
+    const conversationId = created.body.conversation.id as string;
+    const otherConversationId = other.body.conversation.id as string;
+    const makeFile = (targetConversationId: string, senderId: string, filename: string, deleted = false) => ({
+      conversationId: targetConversationId,
+      senderId,
+      type: "file" as const,
+      text: "",
+      file: {
+        storageKey: `converse-attachments/${targetConversationId}/${randomUUID()}.pdf`,
+        filename,
+        contentType: "application/pdf" as const,
+        size: 128,
+        sha256: "c".repeat(64),
+      },
+      idempotencyKey: randomUUID(),
+      ...(deleted ? { deletedAt: new Date() } : {}),
+    });
+    const [deletedFile] = await Message.insertMany([
+      makeFile(conversationId, alice.userId, "deleted.pdf", true),
+    ]);
+    if (!deletedFile) throw new Error("Expected deleted file fixture to be inserted");
+    const [oldestFile, newestFile] = await Message.insertMany([
+      makeFile(conversationId, bob.userId, "oldest.pdf"),
+      makeFile(conversationId, alice.userId, "newest.pdf"),
+    ]);
+    const unrelatedFile = await Message.create(makeFile(otherConversationId, outsider.userId, "unrelated.pdf"));
+    const filesPath = `/api/v1/conversations/${conversationId}/files`;
+
+    await request(baseUrl).get(filesPath).expect(401);
+    await outsider.agent.get(filesPath).expect(404);
+    await bob.agent.get(`${filesPath}?limit=0`).expect(400);
+
+    const firstPage = await alice.agent.get(filesPath).query({ limit: 1 }).expect(200);
+    expect(firstPage.body.messages).toHaveLength(1);
+    expect(firstPage.body.messages[0]).toMatchObject({
+      id: newestFile?._id.toString(),
+      file: {
+        filename: "newest.pdf",
+        size: 128,
+        url: `/api/v1/conversations/${conversationId}/messages/${newestFile?._id.toString()}/file`,
+      },
+    });
+    expect(firstPage.body.nextCursor).toEqual(expect.any(String));
+    expect(JSON.stringify(firstPage.body)).not.toContain("storageKey");
+    const nextPage = await bob.agent.get(filesPath)
+      .query({ limit: 1, before: firstPage.body.nextCursor as string })
+      .expect(200);
+    expect(nextPage.body.messages[0].id).toBe(oldestFile?._id.toString());
+    expect(nextPage.body.nextCursor).toBeNull();
+    expect(JSON.stringify([firstPage.body, nextPage.body])).not.toContain(deletedFile._id.toString());
+    expect(JSON.stringify([firstPage.body, nextPage.body])).not.toContain(unrelatedFile._id.toString());
   });
 
   it("updates only the authenticated user's display name, bio, and optional photo atomically", async () => {

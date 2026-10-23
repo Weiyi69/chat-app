@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
+import type { InfiniteData } from "@tanstack/react-query";
 
 import { chatApi } from "../lib/api";
-import type { Message } from "../types";
+import type { Message, MessagePage } from "../types";
 
 export function mergeMessages(current: Message[], incoming: Message[]): Message[] {
   const byId = new Map(current.map((message) => [message.id, message]));
@@ -11,6 +12,35 @@ export function mergeMessages(current: Message[], incoming: Message[]): Message[
       new Date(first.createdAt).getTime() - new Date(second.createdAt).getTime() ||
       first.id.localeCompare(second.id),
   );
+}
+
+export function updatePinnedMessages(
+  current: InfiniteData<MessagePage, string | undefined> | undefined,
+  message: Message,
+): InfiniteData<MessagePage, string | undefined> | undefined {
+  if (!current) return current;
+  const pages = current.pages.map((page) => ({
+    ...page,
+    messages: page.messages.filter((item) => item.id !== message.id),
+  }));
+  if (!message.pinnedAt) return { ...current, pages };
+
+  const firstPage = pages[0];
+  if (!firstPage) {
+    return {
+      ...current,
+      pages: [{ messages: [message], nextCursor: null }],
+      pageParams: [undefined],
+    };
+  }
+  const messages = [...firstPage.messages, message].sort((first, second) => {
+    const timeDifference = new Date(second.pinnedAt ?? 0).getTime() - new Date(first.pinnedAt ?? 0).getTime();
+    return timeDifference || second.id.localeCompare(first.id);
+  });
+  return {
+    ...current,
+    pages: [{ ...firstPage, messages: messages.slice(0, 24) }, ...pages.slice(1)],
+  };
 }
 
 export function Avatar({

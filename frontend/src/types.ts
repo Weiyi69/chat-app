@@ -45,7 +45,7 @@ export interface Message {
   id: string;
   conversationId: string;
   senderId: string;
-  type: "text" | "image";
+  type: "text" | "image" | "file";
   text: string;
   createdAt: string;
   revision?: number;
@@ -56,7 +56,7 @@ export interface Message {
     id: string;
     senderName: string;
     text: string;
-    type: "text" | "image";
+    type: "text" | "image" | "file";
   };
   forwardedFrom?: {
     senderName: string;
@@ -68,6 +68,17 @@ export interface Message {
     size: number;
     width: number;
     height: number;
+    url: string;
+  };
+  file?: {
+    filename: string;
+    contentType:
+      | "application/pdf"
+      | "text/plain"
+      | "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+      | "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+      | "text/csv";
+    size: number;
     url: string;
   };
 }

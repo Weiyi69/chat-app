@@ -7,7 +7,7 @@ import { chatApi, socketUrl } from "../lib/api";
 import type { Conversation, Message, MessagePage } from "../types";
 import { ChatView } from "./ChatView";
 import { ConversationSidebar } from "./ConversationSidebar";
-import { mergeMessages } from "./chat-utils";
+import { mergeMessages, updatePinnedMessages } from "./chat-utils";
 
 function mergeMessageIntoPage(current: MessagePage | undefined, message: Message): MessagePage {
   const updatedReplies = (current?.messages ?? []).map((candidate) => {
@@ -21,6 +21,8 @@ function mergeMessageIntoPage(current: MessagePage | undefined, message: Message
           ? "This message was deleted."
           : message.type === "image"
             ? (message.text || "Photo")
+            : message.type === "file"
+              ? (message.file?.filename || "File")
             : message.text,
         type: message.type,
       },
@@ -44,7 +46,7 @@ function updateConversationPreview(current: Conversation[] | undefined, message:
       return {
         ...conversation,
         latestMessage: {
-          text: (message.text || "[Image]").slice(0, 200),
+          text: (message.text || (message.type === "file" ? "[File]" : "[Image]")).slice(0, 200),
           createdAt: message.createdAt,
         },
       };
@@ -103,6 +105,8 @@ export function ChatWorkspace() {
       void queryClient.invalidateQueries({ queryKey: ["receipts"] });
       void queryClient.invalidateQueries({ queryKey: ["messages"] });
       void queryClient.invalidateQueries({ queryKey: ["shared-media"] });
+      void queryClient.invalidateQueries({ queryKey: ["shared-files"] });
+      void queryClient.invalidateQueries({ queryKey: ["pinned-messages"] });
     };
     const onDisconnect = () => setSocketConnected(false);
     const onConnectError = () => {
@@ -123,6 +127,9 @@ export function ChatWorkspace() {
         );
         void queryClient.invalidateQueries({ queryKey: ["shared-media", message.conversationId] });
       }
+      if (message.type === "file") {
+        void queryClient.invalidateQueries({ queryKey: ["shared-files", message.conversationId] });
+      }
     };
     const onMessageUpdated = (message: Message) => {
       queryClient.setQueryData<MessagePage>(["messages", message.conversationId], (current) =>
@@ -131,12 +138,20 @@ export function ChatWorkspace() {
       queryClient.setQueryData<Conversation[]>(["conversations"], (current) =>
         updateConversationPreview(current, message),
       );
+      queryClient.setQueryData<InfiniteData<MessagePage, string | undefined>>(
+        ["pinned-messages", message.conversationId],
+        (current) => updatePinnedMessages(current, message),
+      );
+      void queryClient.invalidateQueries({ queryKey: ["pinned-messages", message.conversationId] });
       if (message.type === "image") {
         queryClient.setQueryData<InfiniteData<MessagePage, string | undefined>>(
           ["shared-media", message.conversationId],
           (current) => updateSharedMedia(current, message),
         );
         void queryClient.invalidateQueries({ queryKey: ["shared-media", message.conversationId] });
+      }
+      if (message.type === "file") {
+        void queryClient.invalidateQueries({ queryKey: ["shared-files", message.conversationId] });
       }
     };
     const onGroupUpdated = ({ conversationId }: { conversationId: string }) => {
@@ -234,6 +249,35 @@ export function ChatWorkspace() {
       );
       void queryClient.invalidateQueries({ queryKey: ["shared-media", activeConversation.id] });
     }
+    if (message.type === "file") {
+      void queryClient.invalidateQueries({ queryKey: ["shared-files", activeConversation.id] });
+    }
+  }
+
+  async function sendFile(
+    file: File,
+    caption: string,
+    clientId: string,
+    onProgress: (progress: number) => void,
+    signal: AbortSignal,
+    replyToMessageId?: string,
+  ) {
+    if (!activeConversation) return;
+    const message = await chatApi.sendFile(
+      activeConversation.id,
+      file,
+      caption,
+      clientId,
+      onProgress,
+      signal,
+      replyToMessageId,
+    );
+    queryClient.setQueryData<MessagePage>(["messages", activeConversation.id], (current) =>
+      mergeMessageIntoPage(current, message),
+    );
+    queryClient.setQueryData<Conversation[]>(["conversations"], (current) =>
+      updateConversationPreview(current, message),
+    );
   }
 
   function markRead(conversationId: string, messageId: string) {
@@ -275,6 +319,7 @@ export function ChatWorkspace() {
     if (!activeConversation) return;
     const message = await chatApi.setMessagePinned(activeConversation.id, messageId, pinned);
     onMessageUpdatedInCache(message);
+    return message;
   }
 
   async function forwardMessage(
@@ -299,12 +344,20 @@ export function ChatWorkspace() {
     queryClient.setQueryData<Conversation[]>(["conversations"], (current) =>
       updateConversationPreview(current, message),
     );
+    queryClient.setQueryData<InfiniteData<MessagePage, string | undefined>>(
+      ["pinned-messages", message.conversationId],
+      (current) => updatePinnedMessages(current, message),
+    );
+    void queryClient.invalidateQueries({ queryKey: ["pinned-messages", message.conversationId] });
     if (message.type === "image") {
       queryClient.setQueryData<InfiniteData<MessagePage, string | undefined>>(
         ["shared-media", message.conversationId],
         (current) => updateSharedMedia(current, message),
       );
       void queryClient.invalidateQueries({ queryKey: ["shared-media", message.conversationId] });
+    }
+    if (message.type === "file") {
+      void queryClient.invalidateQueries({ queryKey: ["shared-files", message.conversationId] });
     }
   }
 
@@ -328,6 +381,7 @@ export function ChatWorkspace() {
             onBack={() => setActiveId(null)}
             onSend={sendMessage}
             onSendImage={sendImage}
+            onSendFile={sendFile}
             onMarkRead={(messageId) => markRead(activeConversation.id, messageId)}
             onEditMessage={(messageId, text, revision) =>
               editMessage(activeConversation.id, messageId, text, revision)}

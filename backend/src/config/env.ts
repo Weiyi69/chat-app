@@ -21,6 +21,7 @@ const envSchema = z.object({
   CLIENT_ORIGIN: z.string().url().default("http://localhost:5173"),
   IMAGE_STORAGE_DRIVER: z.enum(["local", "s3"]).default("local"),
   IMAGE_MAX_UPLOAD_BYTES: z.coerce.number().int().min(1024).max(20 * 1024 * 1024).default(5 * 1024 * 1024),
+  ATTACHMENT_MAX_UPLOAD_BYTES: z.coerce.number().int().min(1024).max(10 * 1024 * 1024).default(10 * 1024 * 1024),
   IMAGE_LOCAL_STORAGE_DIR: z.string().min(1).default(".data/images"),
   S3_BUCKET: z.string().optional(),
   S3_REGION: z.string().optional(),

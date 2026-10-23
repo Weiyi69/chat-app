@@ -28,12 +28,42 @@ const cursorSchema = z
     return parsed.data;
   });
 
+const pinnedCursorPayloadSchema = z.object({
+  pinnedAt: z.iso.datetime(),
+  id: objectIdSchema,
+}).strict();
+
+const pinnedCursorSchema = z
+  .string()
+  .max(256)
+  .regex(/^[A-Za-z0-9_-]+$/)
+  .transform((encoded, context) => {
+    let payload: unknown;
+    try {
+      payload = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
+    } catch {
+      context.addIssue({ code: "custom", message: "Invalid cursor" });
+      return z.NEVER;
+    }
+
+    const parsed = pinnedCursorPayloadSchema.safeParse(payload);
+    if (!parsed.success) {
+      context.addIssue({ code: "custom", message: "Invalid cursor" });
+      return z.NEVER;
+    }
+    return parsed.data;
+  });
+
 export const messagePageQuerySchema = z.object({
   before: cursorSchema.optional(),
   limit: pageSizeSchema,
 });
 
 export const sharedMediaPageQuerySchema = messagePageQuerySchema;
+export const pinnedMessagePageQuerySchema = z.object({
+  before: pinnedCursorSchema.optional(),
+  limit: pageSizeSchema,
+});
 
 export const sendMessageSchema = z.object({
   text: z.string().trim().min(1).max(4000),
@@ -46,6 +76,8 @@ export const imageMessageUploadSchema = z.object({
   clientId: z.uuid(),
   replyToMessageId: objectIdSchema.optional(),
 }).strict();
+
+export const fileMessageUploadSchema = imageMessageUploadSchema;
 
 export const socketMessageSchema = sendMessageSchema.extend({
   conversationId: objectIdSchema,
@@ -83,5 +115,11 @@ export const forwardMessageSchema = z.object({
 export function encodeMessageCursor(cursor: { createdAt: Date; id: string }): string {
   return Buffer.from(
     JSON.stringify({ createdAt: cursor.createdAt.toISOString(), id: cursor.id }),
+  ).toString("base64url");
+}
+
+export function encodePinnedMessageCursor(cursor: { pinnedAt: Date; id: string }): string {
+  return Buffer.from(
+    JSON.stringify({ pinnedAt: cursor.pinnedAt.toISOString(), id: cursor.id }),
   ).toString("base64url");
 }

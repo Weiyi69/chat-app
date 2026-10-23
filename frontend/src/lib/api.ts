@@ -140,6 +140,86 @@ function uploadImage(
   );
 }
 
+function uploadAttachment(
+  conversationId: string,
+  file: File,
+  caption: string,
+  clientId: string,
+  onProgress: (progress: number) => void,
+  signal: AbortSignal,
+  replyToMessageId?: string,
+): Promise<Message> {
+  return ensureCsrfToken().then((token) =>
+    new Promise<Message>((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      const form = new FormData();
+      form.append("caption", caption);
+      form.append("clientId", clientId);
+      if (replyToMessageId) form.append("replyToMessageId", replyToMessageId);
+      const mimeByExtension: Record<string, string> = {
+        pdf: "application/pdf",
+        txt: "text/plain",
+        docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        csv: "text/csv",
+      };
+      const extension = file.name.split(".").at(-1)?.toLowerCase();
+      const uploadFile = !file.type && extension && Object.hasOwn(mimeByExtension, extension)
+        ? new File([file], file.name, { type: mimeByExtension[extension] })
+        : file;
+      form.append("attachment", uploadFile, file.name);
+      xhr.open(
+        "POST",
+        `${API_BASE}/api/v1/conversations/${encodeURIComponent(conversationId)}/messages/file`,
+      );
+      xhr.withCredentials = true;
+      xhr.setRequestHeader("x-csrf-token", token);
+      xhr.upload.addEventListener("progress", (event) => {
+        if (event.lengthComputable) onProgress(Math.round((event.loaded / event.total) * 100));
+      });
+      const abortUpload = () => xhr.abort();
+      const removeAbortListener = () => signal.removeEventListener("abort", abortUpload);
+      xhr.addEventListener("load", () => {
+        removeAbortListener();
+        if (xhr.status >= 200 && xhr.status < 300) {
+          try {
+            resolve((JSON.parse(xhr.responseText) as { message: Message }).message);
+          } catch {
+            reject(new ApiError("The server returned an invalid response", xhr.status, "INVALID_RESPONSE"));
+          }
+          return;
+        }
+        let payload: { error?: { code?: string; message?: string } } = {};
+        try {
+          payload = JSON.parse(xhr.responseText) as typeof payload;
+        } catch {
+          // Use the generic request error below when the server did not return JSON.
+        }
+        if (xhr.status === 403 && payload.error?.code === "CSRF_INVALID") csrfToken = undefined;
+        reject(new ApiError(
+          payload.error?.message ?? "File could not be sent",
+          xhr.status,
+          payload.error?.code ?? "REQUEST_FAILED",
+        ));
+      });
+      xhr.addEventListener("error", () => {
+        removeAbortListener();
+        reject(new ApiError("Network error while uploading file", 0, "NETWORK_ERROR"));
+      });
+      xhr.addEventListener("abort", () => {
+        removeAbortListener();
+        reject(new DOMException("Upload cancelled", "AbortError"));
+      });
+      if (signal.aborted) {
+        reject(new DOMException("Upload cancelled", "AbortError"));
+        return;
+      }
+      signal.addEventListener("abort", abortUpload, { once: true });
+      xhr.send(form);
+    }),
+  );
+}
+
 function uploadGroupPhoto(
   groupId: string,
   file: File,
@@ -328,6 +408,9 @@ export const chatApi = {
   imageLimits: async () => (await apiRequest<{
     image: { maxUploadBytes: number; contentTypes: string[] };
   }>("/limits")).image,
+  attachmentLimits: async () => (await apiRequest<{
+    attachment: { maxUploadBytes: number; contentTypes: string[]; extensions: string[] };
+  }>("/limits")).attachment,
   groupPhotoLimits: async () => (await apiRequest<{
     avatar: { maxUploadBytes: number; contentTypes: string[] };
   }>("/limits")).avatar,
@@ -394,6 +477,20 @@ export const chatApi = {
       `/conversations/${encodeURIComponent(conversationId)}/media?${query.toString()}`,
     );
   },
+  sharedFiles: (conversationId: string, before?: string) => {
+    const query = new URLSearchParams({ limit: "24" });
+    if (before) query.set("before", before);
+    return apiRequest<MessagePage>(
+      `/conversations/${encodeURIComponent(conversationId)}/files?${query.toString()}`,
+    );
+  },
+  pinnedMessages: (conversationId: string, before?: string) => {
+    const query = new URLSearchParams({ limit: "24" });
+    if (before) query.set("before", before);
+    return apiRequest<MessagePage>(
+      `/conversations/${encodeURIComponent(conversationId)}/pins?${query.toString()}`,
+    );
+  },
   receipts: async (conversationId: string) =>
     (await apiRequest<{ positions: ReadPosition[] }>(
       `/conversations/${encodeURIComponent(conversationId)}/receipts`,
@@ -433,6 +530,7 @@ export const chatApi = {
       { method: "POST", body: JSON.stringify({ destinationConversationId, clientId }) },
     )).message,
   sendImage: uploadImage,
+  sendFile: uploadAttachment,
   loadPrivateImage,
 };
 

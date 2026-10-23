@@ -62,6 +62,17 @@ app.get("/api/v1/limits", (_request, response) => {
       maxUploadBytes: env.IMAGE_MAX_UPLOAD_BYTES,
       contentTypes: ["image/jpeg", "image/png", "image/webp"],
     },
+    attachment: {
+      maxUploadBytes: env.ATTACHMENT_MAX_UPLOAD_BYTES,
+      contentTypes: [
+        "application/pdf",
+        "text/plain",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "text/csv",
+      ],
+      extensions: ["pdf", "txt", "docx", "xlsx", "csv"],
+    },
     avatar: {
       maxUploadBytes: env.AVATAR_MAX_UPLOAD_BYTES,
       contentTypes: ["image/jpeg", "image/png", "image/webp"],
@@ -93,12 +104,19 @@ app.use(
       "code" in error
     ) {
       const tooLarge = error.code === "LIMIT_FILE_SIZE";
+      const isAttachmentUpload = "field" in error && error.field === "attachment";
       response.status(tooLarge ? 413 : 400).json({
         error: {
-          code: tooLarge ? "IMAGE_TOO_LARGE" : "INVALID_UPLOAD",
+          code: tooLarge
+            ? isAttachmentUpload ? "ATTACHMENT_TOO_LARGE" : "IMAGE_TOO_LARGE"
+            : "INVALID_UPLOAD",
           message: tooLarge
-            ? "Image exceeds the configured upload size limit."
-            : "Choose one supported image and retry.",
+            ? isAttachmentUpload
+              ? "File exceeds the configured attachment size limit."
+              : "Image exceeds the configured upload size limit."
+            : isAttachmentUpload
+              ? "Choose one supported file and retry."
+              : "Choose one supported image and retry.",
         },
       });
       return;

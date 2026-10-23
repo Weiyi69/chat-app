@@ -6,6 +6,8 @@ import { findConversationForMember } from "./conversations.js";
 import { ChatRequestError, createPersistedMessage } from "./messages.js";
 import { processUploadedImage, type ProcessedImage } from "./image-processing.js";
 import { imageStorage } from "./image-storage.js";
+import { attachmentStorage } from "./attachment-storage.js";
+import { createPersistedFileMessage, processUploadedAttachment } from "./file-attachments.js";
 
 export async function createPersistedImageMessage(input: {
   conversationId: string;
@@ -130,7 +132,7 @@ export async function forwardPersistedMessage(input: {
     createdAt: source.forwardedFrom?.createdAt ?? source.createdAt,
   };
 
-  if (source.type !== "image" || !source.image) {
+  if (source.type === "text") {
     const stillAuthorized = await Promise.all([
       findConversationForMember(input.sourceConversationId, input.userId),
       Message.findOne({
@@ -149,6 +151,38 @@ export async function forwardPersistedMessage(input: {
       idempotencyKey: input.idempotencyKey,
       forwardedFrom,
     });
+  }
+
+  if (source.type === "file" && source.file) {
+    const sourceBytes = await attachmentStorage.read(source.file.storageKey);
+    const stillAuthorizedSource = await Promise.all([
+      findConversationForMember(input.sourceConversationId, input.userId),
+      Message.findOne({
+        _id: source._id,
+        conversationId: sourceConversation._id,
+        deletedAt: { $exists: false },
+      }).select("_id").lean(),
+    ]);
+    if (!stillAuthorizedSource[0] || stillAuthorizedSource[0].archivedAt || !stillAuthorizedSource[1]) {
+      throw new ChatRequestError(404, "MESSAGE_NOT_FOUND", "Message not found");
+    }
+    const attachment = await processUploadedAttachment({
+      data: sourceBytes,
+      originalName: source.file.filename,
+      declaredMimeType: source.file.contentType,
+    });
+    return createPersistedFileMessage({
+      conversationId: input.destinationConversationId,
+      senderId: input.userId,
+      text: source.text,
+      idempotencyKey: input.idempotencyKey,
+      attachment,
+      forwardedFrom,
+    });
+  }
+
+  if (source.type !== "image" || !source.image) {
+    throw new ChatRequestError(404, "MESSAGE_NOT_FOUND", "Message not found");
   }
 
   const sourceBytes = await imageStorage.read(source.image.storageKey);

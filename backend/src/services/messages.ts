@@ -5,7 +5,7 @@ import { Message } from "../models/message.js";
 import { User } from "../models/user.js";
 import { avatarUrlFor } from "./avatars.js";
 import { ChatRequestError } from "./chat-errors.js";
-import { encodeMessageCursor } from "../validators/messages.js";
+import { encodeMessageCursor, encodePinnedMessageCursor } from "../validators/messages.js";
 import { findConversationForMember } from "./conversations.js";
 
 export { ChatRequestError } from "./chat-errors.js";
@@ -21,6 +21,11 @@ export function serializeMessage(message: {
     size: number;
     width: number;
     height: number;
+  } | null;
+  file?: {
+    filename: string;
+    contentType: string;
+    size: number;
   } | null;
   replyToMessageId?: { toString(): string } | null;
   forwardedFrom?: {
@@ -58,17 +63,31 @@ export function serializeMessage(message: {
     ...(message.pinnedAt ? { pinnedAt: message.pinnedAt.toISOString() } : {}),
     ...(sender ? { sender } : {}),
   };
-  if (isDeleted || !message.image) return serialized;
-  return {
-    ...serialized,
-    image: {
-      contentType: message.image.contentType,
-      size: message.image.size,
-      width: message.image.width,
-      height: message.image.height,
-      url: `/api/v1/conversations/${serialized.conversationId}/messages/${serialized.id}/image`,
-    },
-  };
+  if (isDeleted) return serialized;
+  if (message.image) {
+    return {
+      ...serialized,
+      image: {
+        contentType: message.image.contentType,
+        size: message.image.size,
+        width: message.image.width,
+        height: message.image.height,
+        url: `/api/v1/conversations/${serialized.conversationId}/messages/${serialized.id}/image`,
+      },
+    };
+  }
+  if (message.file) {
+    return {
+      ...serialized,
+      file: {
+        filename: message.file.filename,
+        contentType: message.file.contentType,
+        size: message.file.size,
+        url: `/api/v1/conversations/${serialized.conversationId}/messages/${serialized.id}/file`,
+      },
+    };
+  }
+  return serialized;
 }
 
 export async function serializeMessageForDelivery(message: Parameters<typeof serializeMessage>[0]) {
@@ -78,7 +97,7 @@ export async function serializeMessageForDelivery(message: Parameters<typeof ser
       ? Message.findOne({
           _id: message.replyToMessageId,
           conversationId: message.conversationId,
-        }).select("_id senderId type text deletedAt").lean()
+        }).select("_id senderId type text file.filename deletedAt").lean()
       : Promise.resolve(null),
   ]);
   const replySender = replyMessage
@@ -92,7 +111,9 @@ export async function serializeMessageForDelivery(message: Parameters<typeof ser
           ? DELETED_MESSAGE_TEXT
           : replyMessage.type === "image"
             ? (replyMessage.text || "Photo")
-            : replyMessage.text || "",
+            : replyMessage.type === "file"
+              ? (replyMessage.file?.filename || "File")
+              : replyMessage.text || "",
         type: replyMessage.type ?? "text",
       }
     : null;
@@ -112,6 +133,13 @@ export async function createPersistedMessage(input: {
     size: number;
     width: number;
     height: number;
+    sha256: string;
+  };
+  file?: {
+    storageKey: string;
+    filename: string;
+    contentType: string;
+    size: number;
     sha256: string;
   };
   replyToMessageId?: string;
@@ -141,9 +169,10 @@ export async function createPersistedMessage(input: {
     message = await Message.create({
       conversationId: new Types.ObjectId(input.conversationId),
       senderId: new Types.ObjectId(input.senderId),
-      type: input.image ? "image" : "text",
+      type: input.image ? "image" : input.file ? "file" : "text",
       text: input.text,
       image: input.image,
+      file: input.file,
       idempotencyKey: input.idempotencyKey,
       ...(input.replyToMessageId ? { replyToMessageId: new Types.ObjectId(input.replyToMessageId) } : {}),
       ...(input.forwardedFrom
@@ -168,16 +197,20 @@ export async function createPersistedMessage(input: {
       idempotencyKey: input.idempotencyKey,
     });
     if (!message) throw error;
-    const sameType = (message.type ?? "text") === (input.image ? "image" : "text");
-    const sameImage = input.image
+    const expectedType = input.image ? "image" : input.file ? "file" : "text";
+    const sameType = (message.type ?? "text") === expectedType;
+    const sameAttachment = input.image
       ? message.image?.sha256 === input.image.sha256
-      : !message.image;
+      : input.file
+        ? message.file?.sha256 === input.file.sha256 &&
+          message.file?.filename === input.file.filename
+        : !message.image && !message.file;
     const sameReply = message.replyToMessageId?.toString() === input.replyToMessageId;
     const sameForward = input.forwardedFrom
       ? message.forwardedFrom?.originalConversationId.toString() === input.forwardedFrom.originalConversationId &&
         message.forwardedFrom?.originalMessageId.toString() === input.forwardedFrom.originalMessageId
       : !message.forwardedFrom;
-    if (message.text !== input.text || !sameType || !sameImage || !sameReply || !sameForward) {
+    if (message.text !== input.text || !sameType || !sameAttachment || !sameReply || !sameForward) {
       throw new ChatRequestError(409, "IDEMPOTENCY_CONFLICT", "Message retry does not match the original");
     }
   }
@@ -197,7 +230,7 @@ export async function createPersistedMessage(input: {
     {
       $set: {
         lastMessageId: message._id,
-        lastMessageText: (message.text || "[Image]").slice(0, 200),
+        lastMessageText: (message.text || (message.type === "file" ? "[File]" : "[Image]")).slice(0, 200),
         lastMessageAt: message.createdAt,
         lastActivityAt: message.createdAt,
       },
@@ -261,7 +294,9 @@ export async function getMessagePage(input: {
               ? DELETED_MESSAGE_TEXT
               : replyMessage.type === "image"
                 ? (replyMessage.text || "Photo")
-                : replyMessage.text || "",
+                : replyMessage.type === "file"
+                  ? (replyMessage.file?.filename || "File")
+                  : replyMessage.text || "",
             type: replyMessage.type ?? "text",
           }
         : null;
@@ -318,6 +353,95 @@ export async function getSharedMediaPage(input: {
     nextCursor:
       hasMore && oldest
         ? encodeMessageCursor({ createdAt: oldest.createdAt, id: oldest._id.toString() })
+        : null,
+  };
+}
+
+export async function getSharedFilesPage(input: {
+  conversationId: string;
+  before?: { createdAt: string; id: string };
+  limit: number;
+}) {
+  const conversationId = new Types.ObjectId(input.conversationId);
+  const filter: Record<string, unknown> = {
+    conversationId,
+    type: "file",
+    deletedAt: { $exists: false },
+  };
+  if (input.before) {
+    const createdAt = new Date(input.before.createdAt);
+    filter.$or = [
+      { createdAt: { $lt: createdAt } },
+      { createdAt, _id: { $lt: new Types.ObjectId(input.before.id) } },
+    ];
+  }
+
+  const documents = await Message.find(filter)
+    .sort({ createdAt: -1, _id: -1 })
+    .limit(input.limit + 1)
+    .lean();
+  const hasMore = documents.length > input.limit;
+  const page = documents.slice(0, input.limit);
+  const oldest = page.at(-1);
+  const senders = await User.find({ _id: { $in: [...new Set(page.map((message) => message.senderId.toString()))] } })
+    .select("displayName +avatarKey +avatarVersion")
+    .lean();
+  const senderById = new Map(senders.map((sender) => [sender._id.toString(), sender]));
+
+  return {
+    messages: page.reverse().map((message) => {
+      const sender = senderById.get(message.senderId.toString());
+      return serializeMessage(message, sender
+        ? { displayName: sender.displayName, avatarUrl: avatarUrlFor(sender) }
+        : undefined);
+    }),
+    nextCursor:
+      hasMore && oldest
+        ? encodeMessageCursor({ createdAt: oldest.createdAt, id: oldest._id.toString() })
+        : null,
+  };
+}
+
+export async function getPinnedMessagePage(input: {
+  conversationId: string;
+  before?: { pinnedAt: string; id: string };
+  limit: number;
+}) {
+  const conversationId = new Types.ObjectId(input.conversationId);
+  const filter: Record<string, unknown> = {
+    conversationId,
+    pinnedAt: { $exists: true },
+  };
+  if (input.before) {
+    const pinnedAt = new Date(input.before.pinnedAt);
+    filter.$or = [
+      { pinnedAt: { $lt: pinnedAt } },
+      { pinnedAt, _id: { $lt: new Types.ObjectId(input.before.id) } },
+    ];
+  }
+
+  const documents = await Message.find(filter)
+    .sort({ pinnedAt: -1, _id: -1 })
+    .limit(input.limit + 1)
+    .lean();
+  const hasMore = documents.length > input.limit;
+  const page = documents.slice(0, input.limit);
+  const last = page.at(-1);
+  const senders = await User.find({ _id: { $in: [...new Set(page.map((message) => message.senderId.toString()))] } })
+    .select("displayName +avatarKey +avatarVersion")
+    .lean();
+  const senderById = new Map(senders.map((sender) => [sender._id.toString(), sender]));
+
+  return {
+    messages: page.map((message) => {
+      const sender = senderById.get(message.senderId.toString());
+      return serializeMessage(message, sender
+        ? { displayName: sender.displayName, avatarUrl: avatarUrlFor(sender) }
+        : undefined);
+    }),
+    nextCursor:
+      hasMore && last?.pinnedAt
+        ? encodePinnedMessageCursor({ pinnedAt: last.pinnedAt, id: last._id.toString() })
         : null,
   };
 }
